@@ -49,7 +49,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     # Args from environment
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
-        
+
     return args
 
 def validate_args(args, defaults={}):
@@ -180,6 +180,15 @@ def validate_args(args, defaults={}):
         assert args.DDP_impl == 'local'
         assert args.use_contiguous_buffers_in_local_ddp
 
+    if args.overlapped_distributed_optimizer:
+        args.use_contiguous_buffers_in_local_ddp = False
+        if args.rank == 0:
+            print('Disable contiguous grad buffer in DDP, since the optimizer would handle it.', flush=True)
+        
+        args.gradient_accumulation_fusion = False
+        if args.rank == 0:
+            print('Disable gradient accumulation fusion, since the optimizer would handle it.', flush=True)
+
     # For torch DDP, we do not use contiguous buffer
     if args.DDP_impl == 'torch':
         args.use_contiguous_buffers_in_local_ddp = False
@@ -245,16 +254,16 @@ def validate_args(args, defaults={}):
         _check_arg_is_not_none(args, req_arg)
 
     # Checks.
-    if args.ffn_hidden_size is None:
-        args.ffn_hidden_size = 4 * args.hidden_size
-
-    if args.swiglu:
+    if args.swiglu and args.ffn_hidden_size is None:
         # reduce the dimnesion for MLP since projections happens on
         # two linear layers. this keeps the number of paramters in
         # the same ballpark as the counterpart with 4*h size
         # we keep it a multiple of 64, which means the actual tensor size
         # will be a multiple of 64 / tp_size
         args.ffn_hidden_size = int((4 * args.hidden_size * 2 / 3) / 64) * 64
+
+    if args.ffn_hidden_size is None:
+        args.ffn_hidden_size = 4 * args.hidden_size
 
     if args.kv_channels is None:
         assert args.hidden_size % args.num_attention_heads == 0
@@ -345,7 +354,8 @@ def validate_args(args, defaults={}):
     if args.sequence_parallel:
         args.async_tensor_model_parallel_allreduce = False
 
-    if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
+    if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1" \
+        and not args.overlapped_distributed_optimizer:
         if args.sequence_parallel:
             raise RuntimeError(
                 "Using sequence parallelism requires setting the environment variable "
@@ -556,7 +566,11 @@ def _add_network_size_args(parser):
     group.add_argument('--num-experts', type=int, default=None,
                        help='Number of Experts in Switch Transformer (None means no Switch)')
     group.add_argument('--untie-embeddings-and-output-weights', action='store_true',
-                       help='Untie embeddings and output weights.'),
+                       help='Untie embeddings and output weights.')
+    group.add_argument('--RMSNorm', action='store_true',
+                       help='Use RMSNorm for LayerNorm')
+    group.add_argument('--causal-lm', action='store_true',
+                       help='Causal output')
     return parser
 
 
@@ -782,6 +796,8 @@ def _add_training_args(parser):
                        help='Disable fusing gradient accumulation to weight '
                        'gradient computation of linear layers',
                        dest='gradient_accumulation_fusion')
+    group.add_argument('--job-name', type=str, default=None,
+                       help='Job name.')
     return parser
 
 
@@ -882,7 +898,13 @@ def _add_checkpointing_args(parser):
                        help="If '--load' is set, but checkpoint is not found "
                        "(e.g., path typo), then exit instead of random "
                        "initialization.")
-
+    group.add_argument('--distributed-checkpointing', action='store_true',
+                       help="Use distributed checkpointing, i.e. each DP node will save/load"
+                            "its own checkpoint instead of save/load via DP rank 0. "
+                            "This will speed up checkpoint save/load.")
+    group.add_argument('--checkpoint-dir-name', type=str, default=None,
+                       help="Checkpoint directory name to load checkpoints from. e.g. checkpoint-2000"
+                            "This does not include the root part of a full path. Normally user don't need to set this.")
     return parser
 
 
@@ -981,8 +1003,13 @@ def _add_distributed_args(parser):
                        'transformer layers. (For T5, this flag currently only '
                        'affects the encoder embedding.)')
     group.add_argument('--use-distributed-optimizer', action='store_true',
-                       help='Use distributed optimizer.')
-
+                       default=False, help='Use distributed optimizer.')
+    group.add_argument('--overlapped-distributed-optimizer', action='store_true',
+                       default=False, help='Use distributed optimizer.')
+    group.add_argument('--reduce-bucket-size', default=500000000, type=float,
+                       help='Bucket size for reduce in OverlapedDistributedOptimizer')
+    group.add_argument('--last-bucket-split-count', type=int, default=None, help='Number of \
+                       splits to split the last bucket.')
     return parser
 
 
@@ -995,6 +1022,8 @@ def _add_validation_args(parser):
     group.add_argument('--eval-interval', type=int, default=1000,
                        help='Interval between running evaluation on '
                        'validation set.')
+    group.add_argument('--verify-grad-order', action='store_true',
+                       default=False, help='Verify the order of grad in each reduced bucket.')
 
     return parser
 
@@ -1068,10 +1097,13 @@ def _add_data_args(parser):
                                 'GPT2BPETokenizer',
                                 'SentencePieceTokenizer',
                                 'GPTSentencePieceTokenizer',
-                                'NullTokenizer'],
+                                'NullTokenizer',
+                                'PretrainedFromHF'],
                        help='What type of tokenizer to use.')
     group.add_argument('--tokenizer-model', type=str, default=None,
                        help='Sentencepiece tokenizer model.')
+    group.add_argument('--tokenizer-name-or-path', type=str, default=None,
+                       help='tokenizer model path for PretrainedFromHF.')
     group.add_argument('--data-impl', type=str, default='infer',
                        choices=['lazy', 'cached', 'mmap', 'infer'],
                        help='Implementation of indexed datasets.')
@@ -1191,14 +1223,14 @@ def _add_vision_args(parser):
     group.add_argument('--swin-backbone-type', type=str, default='tiny',
                        choices=['tiny', 'base', 'h3'],
                        help='pretraining objectives')
-    
+
     # inpainting arguments
     group.add_argument('--mask-type', type=str, default='random',
                        choices=['random', 'row'],
                        help='mask types')
     group.add_argument('--mask-factor', type=float, default=1.0,
                        help='mask size scaling parameter')
- 
+
     # dino arguments
     group.add_argument('--iter-per-epoch', type=int, default=1250,
                        help='iterations per epoch')

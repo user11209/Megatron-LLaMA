@@ -327,7 +327,7 @@ def forward_backward_no_pipelining(*,
                                    no_sync_func: Optional[Callable] = None,
                                    grad_sync_func: Optional[Callable] = None, # unused
                                    param_sync_func: Optional[Callable] = None, # unused
-                                   ):
+                                   optimizer=None):
     """Run forward and backward passes with no pipeline parallelism
     (no inter-stage communication).
 
@@ -363,6 +363,8 @@ def forward_backward_no_pipelining(*,
             if not forward_only:
                 backward_step(grad_scaler, input_tensor, output_tensor,
                               output_tensor_grad, model_type, timers, deallocate_pipeline_outputs)
+                if optimizer is not None:
+                    optimizer.backward_epilogue()
 
     # Run computation for last microbatch out of context handler (want to
     # synchronize gradients).
@@ -373,6 +375,8 @@ def forward_backward_no_pipelining(*,
     if not forward_only:
         backward_step(grad_scaler, input_tensor, output_tensor,
                       output_tensor_grad, model_type, timers, deallocate_pipeline_outputs)
+        if optimizer is not None:
+            optimizer.backward_epilogue()
 
     return forward_data_store
 
@@ -395,6 +399,7 @@ def forward_backward_pipelining_with_interleaving(*,
                                                   no_sync_func: Optional[Callable] = None,
                                                   grad_sync_func: Optional[Callable] = None,
                                                   param_sync_func: Optional[Callable] = None,
+                                                  optimizer=None
                                                   ):
     """Run interleaved 1F1B schedule (model split into model chunks), with
     communication between pipeline stages as needed.
@@ -889,6 +894,7 @@ def forward_backward_pipelining_without_interleaving(*,
                                                      no_sync_func: Optional[Callable] = None,
                                                      grad_sync_func: Optional[Callable] = None,
                                                      param_sync_func: Optional[Callable] = None, # unused
+                                                     optimizer=None
                                                      ):
     """Run non-interleaved 1F1B schedule, with communication between pipeline
     stages.

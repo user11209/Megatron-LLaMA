@@ -95,8 +95,10 @@ def get_args():
     group.add_argument('--tokenizer-type', type=str, required=True,
                        choices=['BertWordPieceLowerCase','BertWordPieceCase',
                                 'GPT2BPETokenizer', 'SentencePieceTokenizer', 
-                                'GPTSentencePieceTokenizer', 'NullTokenizer'],
+                                'GPTSentencePieceTokenizer', 'NullTokenizer', 'PretrainedFromHF'],
                        help='What type of tokenizer to use.')
+    group.add_argument('--tokenizer-name-or-path', type=str, default=None,
+                       help='tokenizer model path for PretrainedFromHF .')
     group.add_argument('--vocab-file', type=str, default=None,
                        help='Path to the vocab file')
     group.add_argument('--merge-file', type=str, default=None,

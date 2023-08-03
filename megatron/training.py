@@ -26,6 +26,7 @@ from megatron.checkpointing import load_checkpoint
 from megatron.checkpointing import save_checkpoint
 from megatron.model import Float16Module
 from megatron.model import GPTModel
+from megatron.model import LLaMAModel
 from megatron.core.enums import ModelType
 from megatron.optimizer import get_megatron_optimizer
 from megatron.initialize import initialize_megatron
@@ -258,8 +259,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         model = [model]
 
     # Disallow training and inference with Transformer Engine
-    # for non-GPT models
-    args.allow_transformer_engine = all([type(m) == GPTModel for m in model])
+    # for non-GPT and non-LLaMA models
+    args.allow_transformer_engine = all([type(m) == GPTModel for m in model]) \
+        or all([type(m) == LLaMAModel for m in model])
     assert args.allow_transformer_engine or args.transformer_impl == 'local', \
         'Transformer Engine is only approved for GPT models'
 
@@ -379,7 +381,7 @@ def setup_model_and_optimizer(model_provider_func,
     if args.load is not None:
         timers = get_timers()
         timers('load-checkpoint', log_level=0).start(barrier=True)
-        args.iteration = load_checkpoint(model, optimizer, opt_param_scheduler)
+        args.iteration = load_checkpoint(model, optimizer, opt_param_scheduler, load_dir=args.checkpoint_dir_name)
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
     else:
@@ -418,6 +420,9 @@ def train_step(forward_step_func, data_iterator,
         barrier=args.barrier_with_L1_time)
     forward_backward_func = get_forward_backward_func()
     fwd_bwd_timers = timers if args.timing_log_level > 1 else None
+    optimizer_for_forward_backward_func = \
+        optimizer if args.overlapped_distributed_optimizer \
+        else None
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step_func,
         data_iterator=data_iterator,
@@ -428,7 +433,8 @@ def train_step(forward_step_func, data_iterator,
         grad_scaler=optimizer.scale_loss,
         sequence_parallel=args.sequence_parallel,
         forward_only=False,
-        timers=fwd_bwd_timers)
+        timers=fwd_bwd_timers,
+        optimizer=optimizer_for_forward_backward_func)
     timers('forward-backward').stop()
 
     # Empty unused memory.
@@ -615,6 +621,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     if iteration % args.log_interval == 0:
         elapsed_time = timers('interval-time').elapsed(barrier=True)
         elapsed_time_per_iteration = elapsed_time / total_iterations
+        token_per_second = int(args.max_position_embeddings) \
+            * int(args.global_batch_size) / elapsed_time_per_iteration
         if writer:
             if args.log_timers_to_tensorboard:
                 writer.add_scalar('iteration-time',
@@ -625,6 +633,10 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             args.consumed_train_samples)
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
             elapsed_time_per_iteration * 1000.0)
+        log_string += ' average overall token/sec : {:.1f} |'.format(
+            token_per_second)
+        log_string += ' average token/sec/GPU : {:.1f} |'.format(
+            token_per_second / args.world_size)
         log_string += ' learning rate: {:.3E} |'.format(learning_rate)
         log_string += ' global batch size: {:5d} |'.format(batch_size)
         for key in total_loss_dict:

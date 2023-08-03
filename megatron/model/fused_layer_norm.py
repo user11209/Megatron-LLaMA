@@ -11,6 +11,7 @@ from torch.nn import init
 import importlib
 
 from megatron.core.utils import make_viewless_tensor
+from megatron import get_args
 
 try:
     from apex.contrib.layer_norm.layer_norm import FastLayerNormFN
@@ -18,7 +19,7 @@ try:
 except:
     HAVE_PERSIST_LAYER_NORM = False
 
-from apex.normalization.fused_layer_norm import FusedLayerNormAffineFunction
+from apex.normalization.fused_layer_norm import FusedLayerNormAffineFunction, FusedRMSNormAffineFunction
 
 
 global fused_layer_norm_cuda
@@ -32,6 +33,8 @@ class MixedFusedLayerNorm(torch.nn.Module):
                sequence_parallel=False,
                apply_layernorm_1p=False):
         super(MixedFusedLayerNorm, self).__init__()
+
+        args = get_args()
 
         self.apply_layernorm_1p = apply_layernorm_1p
 
@@ -53,28 +56,38 @@ class MixedFusedLayerNorm(torch.nn.Module):
         self.normalized_shape = torch.Size(normalized_shape)
         self.eps = eps
         self.weight = Parameter(torch.Tensor(*normalized_shape))
-        self.bias = Parameter(torch.Tensor(*normalized_shape))
+        if not args.RMSNorm:
+            self.bias = Parameter(torch.Tensor(*normalized_shape))
         self.reset_parameters()
         self.no_persist_layer_norm = no_persist_layer_norm
         self.sequence_parallel = sequence_parallel
 
         # set sequence parallelism flag on weight and bias parameters
         setattr(self.weight, 'sequence_parallel', self.sequence_parallel)
-        setattr(self.bias, 'sequence_parallel', self.sequence_parallel)
+        if not args.RMSNorm:
+            setattr(self.bias, 'sequence_parallel', self.sequence_parallel)
 
 
   def reset_parameters(self):
+    args = get_args()
 
     if self.apply_layernorm_1p:
         init.zeros_(self.weight)
-        init.zeros_(self.bias)
+        if not args.RMSNorm:
+            init.zeros_(self.bias)
     else:
         init.ones_(self.weight)
-        init.zeros_(self.bias)
+        if not args.RMSNorm:
+            init.zeros_(self.bias)
 
   def forward(self, input):
 
+    args = get_args()
+
     weight = self.weight + 1 if self.apply_layernorm_1p else self.weight
+
+    if args.RMSNorm:
+        return FusedRMSNormAffineFunction.apply(input, weight, self.normalized_shape, self.eps)
 
     if self.no_persist_layer_norm:
         return FusedLayerNormAffineFunction.apply(input, weight, self.bias, self.normalized_shape, self.eps)

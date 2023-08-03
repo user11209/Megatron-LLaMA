@@ -5,6 +5,8 @@
 from abc import ABC
 from abc import abstractmethod
 
+from transformers import AutoTokenizer
+
 from .bert_tokenization import FullTokenizer as FullBertTokenizer
 from .gpt2_tokenization import GPT2Tokenizer
 
@@ -39,6 +41,9 @@ def build_tokenizer(args):
     elif args.tokenizer_type == 'NullTokenizer':
         assert args.vocab_size is not None
         tokenizer = _NullTokenizer(args.vocab_size)
+    elif args.tokenizer_type == 'PretrainedFromHF':
+        assert args.tokenizer_name_or_path is not None
+        tokenizer = _AutoTokenizer(args.tokenizer_name_or_path, vocab_extra_ids=args.vocab_extra_ids)
     else:
         raise NotImplementedError('{} tokenizer is not '
                                   'implemented.'.format(args.tokenizer_type))
@@ -91,7 +96,7 @@ class AbstractTokenizer(ABC):
         pass
 
     @abstractmethod
-    def tokenize(self, text):
+    def tokenize(self, text, **kwargs):
         pass
 
     def detokenize(self, token_ids):
@@ -534,3 +539,84 @@ class _NullTokenizer:
     @property
     def additional_special_tokens_ids(self):
         return None
+
+
+# Wrapped AutoTokenizer from HuggingFace
+class _AutoTokenizer(AbstractTokenizer):
+    """AutoTokenizer for Hf Pretrained model loading."""
+
+    def __init__(self, tokenizer_name_or_path, vocab_extra_ids=0):
+        name = tokenizer_name_or_path
+        super().__init__(name)
+        hf_tokenizer_kwargs = {}
+        if vocab_extra_ids > 0:
+            hf_tokenizer_kwargs["additional_special_tokens"] = [f"<extra_id_{_id}>" for _id in range(vocab_extra_ids)]
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, **hf_tokenizer_kwargs)
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.encoder = self.tokenizer.get_vocab()
+        self.decoder = {v: k for k, v in self.encoder.items()}
+
+    @property
+    def vocab_size(self):
+        return len(self.tokenizer) # vocab_size doesn't contain additional tokens
+
+    @property
+    def vocab(self):
+        return {
+            **{special_token: self.tokenizer.convert_tokens_to_ids(special_token) for special_token in self.tokenizer.additional_special_tokens},
+            **self.tokenizer.vocab,
+        }
+
+    @property
+    def inv_vocab(self):
+        return {v: k for k, v in self.vocab.items()}
+
+    def tokenize(self, text, **kwargs):
+        return self.tokenizer.encode(text, **kwargs)
+
+    def detokenize(self, token_ids):
+        return self.tokenizer.decode(token_ids)
+
+    @property
+    def eod(self):
+        return self.eos
+
+    @property
+    def cls(self):
+        candidate = self.tokenizer.cls_token_id
+        return self._check_token_candidate(candidate)
+
+    @property
+    def sep(self):
+        candidate = self.tokenizer.sep_token_id
+        return self._check_token_candidate(candidate)
+
+    @property
+    def pad(self):
+        candidate = self.tokenizer.pad_token_id
+        return self._check_token_candidate(candidate)
+
+    @property
+    def mask(self):
+        candidate = self.tokenizer.mask_token_id
+        return self._check_token_candidate(candidate)
+
+    @property
+    def bos(self):
+        raise NotImplementedError("Missing <bos>")
+
+    @property
+    def eos(self):
+        candidate = self.tokenizer.eos_token_id
+        return self._check_token_candidate(candidate)
+
+    @property
+    def additional_special_tokens_ids(self):
+        """ All the additional special tokens you may want to use (list of strings)."""
+        return self.tokenizer.additional_special_tokens_ids
+
+    @staticmethod
+    def _check_token_candidate(candidate):
+        if candidate is None:
+            raise AttributeError("Token doesn't exist")
+        return candidate

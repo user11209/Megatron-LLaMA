@@ -4,3 +4,4 @@ build
 .coverage_*
 *.egg-info
 *~
+*.DS_Store*
