@@ -36,7 +36,7 @@ LLaMA是目前大语言模型开源社区中一项重要工作。LLaMA在LLM的�
 
 ## 2. Megatron-LLaMA中`OverlappedDistributedOptimizer`简介
 
-在原生Megatron-LM中，用户可以使用[`DistributedOptimizer`]("https://github.com/NVIDIA/Megatron-LM/blob/main/docs/distrib_optimizer.md")来切分梯度和优化器状态，以减少训练中的显存占用。`DistributedOptimizer`在每次获得预设的梯度聚合组梯度后，通过`ReduceScatter`算子，将之前累积的全部梯度分发到不同的Rank。每个Rank更新完属于自己的参数后，再通过`AllGather`算子将更新后的参数复制到所有Rank。在实际训练中，我们观察到`DistributedOptimizer`的集合通信在梯度聚合较小的情况下，将引入极大的额外开销。极端情况下，不使用梯度聚合，将引入超过整体耗时50%的额外开销。
+在原生Megatron-LM中，用户可以使用[`DistributedOptimizer`](https://github.com/NVIDIA/Megatron-LM/blob/main/docs/distrib_optimizer.md)来切分梯度和优化器状态，以减少训练中的显存占用。`DistributedOptimizer`在每次获得预设的梯度聚合组梯度后，通过`ReduceScatter`算子，将之前累积的全部梯度分发到不同的Rank。每个Rank更新完属于自己的参数后，再通过`AllGather`算子将更新后的参数复制到所有Rank。在实际训练中，我们观察到`DistributedOptimizer`的集合通信在梯度聚合较小的情况下，将引入极大的额外开销。极端情况下，不使用梯度聚合，将引入超过整体耗时50%的额外开销。
 
 在尝试实现通信和计算并行的过程中，我们尝试了DeepSpeed ZeRO2中对梯度以及优化器状态的切分方式。在超大规模的场景下，我们观察到其切分方式需要大量细碎的通信Kernel，无法充分利用通信带宽，造成了通信耗时过长，模型的计算量不足以与通信充分并行。
 
@@ -142,8 +142,8 @@ Megatron-LLaMA使用Apache 2.0开源协议，允许用作商业用途。详情�
 
 ### 参考工作
 
-[Megatron-LM]("https://github.com/NVIDIA/Megatron-LM")
+[Megatron-LM](https://github.com/NVIDIA/Megatron-LM)
 
-[LLaMA]("https://github.com/facebookresearch/llama")
+[LLaMA](https://github.com/facebookresearch/llama)
 
-[DeepSpeed]("https://github.com/microsoft/DeepSpeed")
+[DeepSpeed](https://github.com/microsoft/DeepSpeed)

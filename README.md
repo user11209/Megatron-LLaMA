@@ -35,7 +35,7 @@ Therefore, to facilitate the training of LLaMA-based models and reduce the cost 
 
 # OverlappedDistributedOptimizer
 
-In the vanilla Megatron-LM, users can leverage [`DistributedOptimizer`]("https://github.com/NVIDIA/Megatron-LM/blob/main/docs/distrib_optimizer.md") to partition gradients and optimizer states to reduce GPU memory occupation. After accumulated all gradients in GA, `DistributedOptimizer` employs a `ReduceScatter` operation to scatter the gradients to the corresponding ranks. Each rank then updates the local parameters, and then collect the remaining parameters through an `AllGather` operation from all the other ranks. However, we observe a significant overhead on communication under small GA settings (over 50% time consumption without GA). 
+In the vanilla Megatron-LM, users can leverage [`DistributedOptimizer`](https://github.com/NVIDIA/Megatron-LM/blob/main/docs/distrib_optimizer.md) to partition gradients and optimizer states to reduce GPU memory occupation. After accumulated all gradients in GA, `DistributedOptimizer` employs a `ReduceScatter` operation to scatter the gradients to the corresponding ranks. Each rank then updates the local parameters, and then collect the remaining parameters through an `AllGather` operation from all the other ranks. However, we observe a significant overhead on communication under small GA settings (over 50% time consumption without GA). 
 
 To mitigate the overhead, we try to overlap the collective communication with computation, according to the partition strategy in DeepSpeed ZeRO Stage-2. This strategy fails to scale. It takes too many small `Reduce` operations at large scale, which makes it under-utilize the inter-connection bandwidth.
 
@@ -125,7 +125,7 @@ In particular, we recommend to increase the micro-batch size to fully occupy the
 | `--tokenizer-type=PretrainedFromHF` | Use a Tokenizer from Huggingface (would be loaded via `transformers.AutoTokenizer`) |
 | `--distributed-checkpointing` | Distributed saving of checkpoint files. |
 
-Megatron-LLaMA supports the canonical [data prepocessing]("https://github.com/NVIDIA/Megatron-LM/blob/main/README.md#data-preprocessing") and [evaluation]("https://github.com/NVIDIA/Megatron-LM/blob/main/README.md#evaluation-and-tasks") as mentioned in the Megatron-LM library.
+Megatron-LLaMA supports the canonical [data prepocessing](https://github.com/NVIDIA/Megatron-LM/blob/main/README.md#data-preprocessing) and [evaluation](https://github.com/NVIDIA/Megatron-LM/blob/main/README.md#evaluation-and-tasks) as mentioned in the Megatron-LM library.
 
 ### Future work
 
@@ -144,9 +144,9 @@ Megatron-LLaMA is developed by Aicheng Technology, Alibaba Group and is based on
 
 The following repositories are used in Megatron-LLaMA, either in close to original form or as an inspiration:
 
-[Megatron-LM]("https://github.com/NVIDIA/Megatron-LM")
+[Megatron-LM](https://github.com/NVIDIA/Megatron-LM)
 
-[LLaMA]("https://github.com/facebookresearch/llama")
+[LLaMA](https://github.com/facebookresearch/llama)
 
-[DeepSpeed]("https://github.com/microsoft/DeepSpeed")
+[DeepSpeed](https://github.com/microsoft/DeepSpeed)
 
