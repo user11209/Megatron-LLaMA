@@ -312,7 +312,7 @@ class CoreAttention(MegatronModule):
                        value_layer.size(3))
 
         # change view [sk, b * np, hn]
-        value_layer = value_layer.view(value_layer.size(0),
+        value_layer = value_layer.reshape(value_layer.size(0),
                                        output_size[0] * output_size[1], -1)
 
         # change view [b * np, sq, sk]
