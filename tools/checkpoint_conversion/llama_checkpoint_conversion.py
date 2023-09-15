@@ -284,6 +284,11 @@ def convert_checkpoint_from_megatron_to_transformers(args):
     Args:
         args (argparse.Namespace): the arguments to the script
     """
+    # Search in directory above this
+    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
+    if args.megatron_path is not None:
+        sys.path.insert(0, args.megatron_path)
+
     # Load Megatron-LM checkpoint arguments from the state dict
     sub_dirs = os.listdir(args.load_path)
     release = False
