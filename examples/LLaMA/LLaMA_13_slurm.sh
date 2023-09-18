@@ -46,9 +46,11 @@ options=" \
         --no-position-embedding \
         --use-rotary-position-embeddings \
         --swiglu \
-        --ffn-hidden-size 13824\
+        --ffn-hidden-size 13824 \
         --disable-bias-linear \
         --RMSNorm \
+        --attention-dropout 0 \
+        --hidden-dropout 0 \
         --layernorm-epsilon 1e-6 \
         --causal-lm \
     --tokenizer-type PretrainedFromHF \
