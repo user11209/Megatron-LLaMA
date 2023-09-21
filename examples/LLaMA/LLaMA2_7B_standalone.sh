@@ -5,7 +5,7 @@ DATASET_2="<PATH TO THE SECOND DATASET>"
 DATASET_3="<PATH TO THE THIRD DATASET>"
 DATASET="0.2 ${DATASET_1} 0.3 ${DATASET_2} 0.5 ${DATASET_3}"
 
-TP_SIZE=2
+TP_SIZE=1
 PP_SIZE=1
 WORLD_SIZE=8
 MICRO_BATCH_SIZE=4
@@ -35,7 +35,7 @@ options=" \
     --num-layers 32 \
         --hidden-size 4096 \
         --num-attention-heads 32 \
-        --seq-length 2048 \
+        --seq-length 4096 \
         --max-position-embeddings 4096 \
         --no-position-embedding \
         --use-rotary-position-embeddings \
