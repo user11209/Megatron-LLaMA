@@ -901,6 +901,9 @@ def forward_backward_pipelining_without_interleaving(*,
 
     Returns dictionary with losses if the last stage, empty dict otherwise."""
 
+    if optimizer is not None:
+        optimizer.gather_parameters(skip_if_not_stepped=True)
+
     if isinstance(model, list):
         assert len(model) == 1, \
             "non-interleaved pipeline parallelism does not support model chunking"
@@ -1015,6 +1018,9 @@ def forward_backward_pipelining_without_interleaving(*,
                 backward_step(grad_scaler, input_tensor, output_tensor,
                               output_tensor_grad, model_type, timers, deallocate_pipeline_outputs)
 
+            if optimizer is not None:
+                    optimizer.backward_epilogue()
+
             if last_iteration:
                 input_tensor = None
                 send_backward(input_tensor_grad, recv_tensor_shapes, timers=timers)
@@ -1045,8 +1051,13 @@ def forward_backward_pipelining_without_interleaving(*,
                 backward_step(grad_scaler, input_tensor, output_tensor,
                               output_tensor_grad, model_type, timers, deallocate_pipeline_outputs)
 
+            if optimizer is not None:
+                    optimizer.backward_epilogue()
+
             send_backward(input_tensor_grad, recv_tensor_shapes, timers=timers)
 
+    if optimizer is not None:
+        optimizer.record_grad_accumulation_boundary()
     # Launch any remaining grad reductions
     if no_sync_context is not None:
         enable_grad_sync()

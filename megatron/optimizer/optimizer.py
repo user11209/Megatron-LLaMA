@@ -208,6 +208,9 @@ class MegatronOptimizer(ABC):
         pipelined model parallelism (BERT and GPT-2).
         """
 
+        if args.causal_lm:
+            return
+
         if mpu.is_rank_in_embedding_group(ignore_virtual=True) and \
                 mpu.get_pipeline_model_parallel_world_size() > 1:
             if mpu.is_pipeline_first_stage(ignore_virtual=True):

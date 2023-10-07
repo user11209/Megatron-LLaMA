@@ -437,7 +437,7 @@ class TransformerLanguageModel(MegatronModule):
                 self.pooler = Pooler(self.hidden_size, self.init_method)
                 self._pooler_key = 'pooler'
 
-            if self.untie_embeddings_and_output_weights:
+            if self.untie_embeddings_and_output_weights and not args.causal_lm:
                 self.output_layer = tensor_parallel.ColumnParallelLinear(
                     args.hidden_size,
                     args.padded_vocab_size,
