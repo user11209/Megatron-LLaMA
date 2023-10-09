@@ -337,6 +337,9 @@ def forward_backward_no_pipelining(*,
     See get_forward_backward_func() for argument details
     """
 
+    if optimizer is not None:
+        optimizer.gather_parameters(skip_if_not_stepped=True)
+
     if isinstance(model, list):
         assert len(model) == 1, \
             "non-pipeline-parallel schedule does not support model chunking"
@@ -377,6 +380,7 @@ def forward_backward_no_pipelining(*,
                       output_tensor_grad, model_type, timers, deallocate_pipeline_outputs)
         if optimizer is not None:
             optimizer.backward_epilogue()
+            optimizer.record_grad_accumulation_boundary()
 
     return forward_data_store
 

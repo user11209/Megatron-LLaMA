@@ -291,6 +291,46 @@ class Range:
         self.size = size
 
 
+class AsyncHandler:
+    def __init__(self) -> None:
+        self._handle = None
+        self._is_waited  = False
+
+    # Can only handle one stream
+    def wait(self):
+        assert self._handle is not None
+
+        if self._is_waited:
+            return
+        
+        self._is_waited = True
+        return self._handle.wait()
+    
+    def reset_handle(self, handle):
+        self._handle = handle
+        self._is_waited = False
+
+
+class AsyncHandlerManager:
+    def __init__(self, bucket_list: list) -> None:
+        self._bucket_list = list(bucket_list)
+        self._bucket_to_handler_map = {}
+        self._param_to_handler_map = {}
+
+        for bucket in self._bucket_list:
+            async_handler = AsyncHandler()
+            self._bucket_to_handler_map[bucket] = async_handler
+            for param in bucket.get_param_list():
+                self._param_to_handler_map[param] = async_handler
+        
+    def set_bucket_handle(self, bucket, handle):
+        async_handler = self._bucket_to_handler_map[bucket]
+        async_handler.reset_handle(handle)
+    
+    def get_param_handle(self, param) -> AsyncHandler:
+        return self._param_to_handler_map[param]
+        
+
 class ParameterBuffer:
     """
     Create a contiguous buffer holding all params. i.e. self._flatted_buffer
@@ -316,6 +356,7 @@ class ParameterBuffer:
         self._make_params_to_be_view_of_buffer()
 
         self._bucket_ranges = {}
+        self._bucket_partitioned_ranges = {}
         self._param_ranges = {}
         self._partition_size = self._flatted_buffer.numel() // self._num_partitions
 
@@ -342,7 +383,7 @@ class ParameterBuffer:
             assert id(bucket.get_param_list()[0]) == id(
                 self._param_list[param_copied])
             bucket_partition_size = bucket.get_partitioned_size()
-            bucket_range = self._bucket_ranges[bucket]
+            bucket_range = self._bucket_partitioned_ranges[bucket]
             bucket_size = bucket.get_total_size()
             start_in_bucket = bucket_partition_size * self._rank
 
@@ -408,21 +449,28 @@ class ParameterBuffer:
 
     def init_partitioned_buffer(self, bucket_assignment: BucketAssignment):
         total_size = int(0)
+        partitioned_total_size = int(0)
         for bucket in bucket_assignment.get_buckets():
+            bucket_size = bucket.get_total_size()
             bucket_size_for_this_rank = bucket.get_partitioned_size()
-            self._bucket_ranges[bucket] = Range(
-                start=total_size, size=bucket_size_for_this_rank)
 
-            total_size += bucket_size_for_this_rank
+            self._bucket_ranges[bucket] = Range(
+                start=total_size, size=bucket_size)
+
+            self._bucket_partitioned_ranges[bucket] = Range(
+                start=partitioned_total_size, size=bucket_size_for_this_rank)
+
+            total_size += bucket_size
+            partitioned_total_size += bucket_size_for_this_rank
 
         self._param_ranges = self._init_param_range(bucket_assignment.get_buckets(), self._rank)
 
-        self._partitioned_param = torch.empty(total_size,
+        self._partitioned_param = torch.empty(partitioned_total_size,
                                               device=self._flatted_buffer.device,
                                               dtype=self._flatted_buffer.dtype)
 
         print(f'Rank: {torch.distributed.get_rank()}, DP Rank: {self._rank}, '
-              f'DP World Size: {self._num_partitions}, Partitioned Size: {total_size}')
+              f'DP World Size: {self._num_partitions}, Partitioned Size: {partitioned_total_size}')
         self.scatter_flatted_param_to_partitioned_param(bucket_assignment)
 
         self._allocate_other_buffers()
@@ -433,7 +481,7 @@ class ParameterBuffer:
         self._allocate_other_buffers()
 
     def get_bucket_receiving_buffer(self, bucket: Bucket):
-        bucket_range = self._bucket_ranges[bucket]
+        bucket_range = self._bucket_partitioned_ranges[bucket]
         # Assuming the grad has the same order with the buffer
         target = self._partitioned_grad_receiving_buffer.narrow(
             0, bucket_range.start, bucket_range.size)
@@ -452,20 +500,23 @@ class ParameterBuffer:
         if id(self._fp32_partitioned_param) != id(self._partitioned_param):
             self._partitioned_param.copy_(self._fp32_partitioned_param)
 
-    def gather_partitioned_param(self, bucket_assignment: BucketAssignment):
-        flatted_buffer_start = int(0)
-        for bucket in bucket_assignment.get_buckets():
+    def gather_partitioned_param(self,
+                                 bucket_assignment: BucketAssignment,
+                                 async_handler_manager: AsyncHandlerManager=None):
+        for bucket in reversed(bucket_assignment.get_buckets()):
             bucket_range = self._bucket_ranges[bucket]
-            bucket_size = bucket.get_total_size()
-            target = self._flatted_buffer.narrow(
-                0, flatted_buffer_start, bucket_size)
-            flatted_buffer_start += bucket_size
-            source = self._partitioned_param.narrow(
-                0, bucket_range.start, bucket_range.size)
-            torch.distributed.all_gather_into_tensor(
-                target, source, group=self._dp_group)
+            bucket_partitioned_range = self._bucket_partitioned_ranges[bucket]
 
-        assert flatted_buffer_start == self._flatted_buffer.numel()
+            target = self._flatted_buffer.narrow(
+                0, bucket_range.start, bucket_range.size)
+            source = self._partitioned_param.narrow(
+                0, bucket_partitioned_range.start, bucket_partitioned_range.size)
+
+            handle = torch.distributed.all_gather_into_tensor(
+                target, source, group=self._dp_group, async_op=True)
+            
+            if async_handler_manager is not None:
+                async_handler_manager.set_bucket_handle(bucket=bucket, handle=handle)
 
     def zero_grad(self):
         self._partitioned_grad.zero_()
@@ -564,6 +615,9 @@ class OverlappedDistributedOptimizer(MixedPrecisionOptimizer):
             is used by the distributed optimizer for mapping parameters.
     """
 
+    _async_handler_manager = None
+    _is_grad_accumulation_boundary = False
+
     def __init__(self,
                  optimizer,
                  clip_grad,
@@ -596,6 +650,7 @@ class OverlappedDistributedOptimizer(MixedPrecisionOptimizer):
         self.is_need_allreduce_layer_norm_grads = \
             mpu.get_tensor_model_parallel_world_size() > 1 and self._args.sequence_parallel
 
+        bucket_list = []
         for group_idx, param_group in enumerate(self.optimizer.param_groups):
             trainable_parameters = [
                 param for param in param_group['params'] if param.requires_grad]
@@ -626,10 +681,16 @@ class OverlappedDistributedOptimizer(MixedPrecisionOptimizer):
             self._param_buffer.append(param_buffer)
             self._bucket_assignment.append(bucket_assignment)
 
+            bucket_list += bucket_assignment.get_buckets()
+
             param_group['params'] = [param_buffer.get_fp32_partitioned_param()]
 
             self._register_hooks(
                 hook=self._grad_hook, param_list=trainable_parameters, group_idx=group_idx)
+
+        OverlappedDistributedOptimizer._async_handler_manager = AsyncHandlerManager(bucket_list)
+        self._register_forward_async_hooks()
+        self._has_stepped = False
 
     def _verify_assignment(self, param_buffer: ParameterBuffer, bucket_assignment: BucketAssignment):
         buckets = bucket_assignment.get_buckets()
@@ -714,6 +775,29 @@ class OverlappedDistributedOptimizer(MixedPrecisionOptimizer):
 
         return found_inf_flag
 
+    @staticmethod
+    def _forward_async_hook(module: torch.nn.Module, inp):
+        if not OverlappedDistributedOptimizer.is_grad_accumulation_boundary():
+            return
+
+        is_leaf = False
+        try:
+            module.children().__next__()
+        except StopIteration:
+            is_leaf = True
+        
+        if is_leaf:
+            async_handler_manager = \
+                OverlappedDistributedOptimizer.get_async_handler_manager()
+            if async_handler_manager is None:
+                return
+            
+            for param in module.parameters():
+                async_handler_manager.get_param_handle(param).wait()
+
+    def _register_forward_async_hooks(self):
+        torch.nn.modules.module.register_module_forward_pre_hook(self._forward_async_hook)
+
     def get_parameters(self):
         params = []
         for param_group in self.optimizer.param_groups:
@@ -751,13 +835,18 @@ class OverlappedDistributedOptimizer(MixedPrecisionOptimizer):
         for param_buffer in self._param_buffer:
             param_buffer.copy_updated_fp32_param()
 
-    def gather_parameters(self):
+    def gather_parameters(self, skip_if_not_stepped=False):
+        if skip_if_not_stepped and not self._has_stepped:
+            return
+
+        # Happened all the LayerNorms are in the second group
         for param_buffer, bucket_assignment in \
-                zip(self._param_buffer, self._bucket_assignment):
-            param_buffer.gather_partitioned_param(bucket_assignment)
+                zip(reversed(self._param_buffer), reversed(self._bucket_assignment)):
+            param_buffer.gather_partitioned_param(bucket_assignment, self._async_handler_manager)
 
     @torch.no_grad()
     def step(self, args, timers):
+        self._has_stepped = True
         torch.cuda.synchronize()
 
         # Do unscale, check for inf, and update grad scaler only for
@@ -795,18 +884,25 @@ class OverlappedDistributedOptimizer(MixedPrecisionOptimizer):
         self.optimizer.step()
 
         self.copy_updated_parameters()
-        self.gather_parameters()
 
         # Successful update.
         return True, grad_norm, num_zeros_in_grad
 
     def backward_epilogue(self):
+        OverlappedDistributedOptimizer._is_grad_accumulation_boundary = False
         with torch.cuda.stream(self._reduction_stream):
             for bucket_assignment in self._bucket_assignment:
                 bucket_assignment.reset_buckets()
 
             for param_buffer in self._param_buffer:
                 param_buffer.accumulate_reduced_grad()
+
+    def record_grad_accumulation_boundary(self):
+        OverlappedDistributedOptimizer._is_grad_accumulation_boundary = True
+    
+    @staticmethod
+    def is_grad_accumulation_boundary():
+        return OverlappedDistributedOptimizer._is_grad_accumulation_boundary
 
     def profile_param_get_grad_order(self):
         for group_idx, param_buffer in enumerate(self._param_buffer):
@@ -818,6 +914,10 @@ class OverlappedDistributedOptimizer(MixedPrecisionOptimizer):
         for param_buffer in self._param_buffer:
             param_buffer.zero_grad()
 
+    @staticmethod
+    def get_async_handler_manager():
+        return OverlappedDistributedOptimizer._async_handler_manager
+        
     def _copy_model_params_to_main_params(self):
         """
         Copy model params to main params.
