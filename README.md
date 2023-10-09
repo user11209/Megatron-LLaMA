@@ -29,7 +29,7 @@ Therefore, to facilitate the training of LLaMA-based models and reduce the cost 
 
 |  | 256xA100 80GB | 512xA100 80GB |
 | ------ | ------ | ------ |
-| Megatron-LLaMA with OverlappedDistributedOptimizer | 1800 (25.1 days) | 1660 (13.6 days) |
+| Megatron-LLaMA with OverlappedDistributedOptimizer | 1890 (23.9 days) | 1845 (12.2 days) |
 | Megatron-LLaMA with DistributedOptimizer| 1630 (27.8 days) | 1430 (15.8 days) |
 
 
