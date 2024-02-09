@@ -18,116 +18,6 @@ from .activation_agent import ActivationAgent, set_activationagent_warmup
 # Types
 Shape = Union[List[int], torch.Size]
 
-def get_forward_backward_func():
-    """Retrieves the appropriate forward_backward function given the
-    configuration of parallel_state.
-
-    Returns a function that will perform all of the forward and
-    backward passes of the model given the pipeline model parallel
-    world size and virtual pipeline model parallel world size in the
-    global parallel_state.
-
-    The function returned takes the following arguments:
-
-    forward_step_func (required): A function that takes a data
-        iterator and a model as its arguments and return the model's
-        forward output and the loss function. The loss function should
-        take one torch.Tensor and return a torch.Tensor of loss and a
-        dictionary of string -> torch.Tensor.
-
-        For example:
-
-        def loss_func(loss_mask, output_tensor):
-            losses = output_tensor.float()
-            loss_mask = loss_mask.view(-1).float()
-            loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
-
-            # Reduce loss for logging.
-            averaged_loss = average_losses_across_data_parallel_group([loss])
-
-            return loss, {'lm loss': averaged_loss[0]}
-
-        def forward_step(data_iterator, model):
-            data, loss_mask = next(data_iterator)
-            output = model(data)
-            return output, partial(loss_func, loss_mask)
-
-
-        forward_backward_func(forward_step_func=forward_step, ...)
-
-
-    data_iterator (required): an iterator over the data, will be
-        passed as is to forward_step_func. Expected to be a list of
-        iterators in the case of interleaved pipeline parallelism.
-
-    model (required): the actual model. Expected to be a list of
-        modules in the case of interleaved pipeline parallelism.
-
-    num_microbatches (int, required):
-        The number of microbatches to go through
-
-    dtype (required when using pipeline parallelism): dtype used in
-        p2p communication, usually params_dtype
-
-    tensor_shape (required when using pipeline parallelism): Shape of
-        tensor. The tensor is expected to be 3D and its order of
-        dimension is supposed to be ``(sequence, batch, hidden)``.
-
-    decoder_seq_length (int, required for ModelType.encoder_and_decoder models):
-        Sequence length of the decoder portion, used to determine tensor shapes.
-
-    grad_scaler (optional, default=None): If using loss scaling,
-        this function should take the loss and return the scaled
-        loss. If None, no function is called on the loss.
-
-    sequence_parallel (optional, default=False):
-        Set to :obj:`True` for this function to handle sequence
-        length.  When :obj:`True`, the sequence length on each tensor
-        model parallel rank is updated to
-        :math:`original\_sequence\_length /
-        tensor\_model\_parallel\_world\_size`.
-        TODO: Do we need this? Just roll into tensor_shape arg?
-
-    forward_only (optional, default=False): Perform only the forward step
-
-    timers (optional, default=None): TODO
-
-    collect_non_loss_data: TODO
-
-    enable_autocast (optional, default=False): If True, runs the
-        forward_step_func call inside torch.autocast context
-
-    deallocate_pipeline_outputs (optional, default=False): If True, output data 
-        is deallocated after the tensor is sent to the next pipeline stage.
-        Helps with saving memory, does nothing when pipeline parallel is 
-        not used.
-    
-    no_sync_func (optional): Function that creates a context that
-        suppresses asynchronous data-parallel communication. If the
-        model is an instance of torch.nn.DistributedDataParallel, the
-        default is to use torch.nn.DistributedDataParallel.no_sync.
-
-    grad_sync_func (optional): Function that launches asynchronous
-        gradient reductions (e.g. distributed optimizer gradient
-        reduce-scatters). The function should take one argument: an
-        iterable of parameters whose gradients are to be synchronized.
-
-    param_sync_func (optional): Function that launches asynchronous
-        parameter synchronizations (e.g. distributed optimizer
-        parameter all-gathers). The function should take one argument:
-        an iterable of parameters to be synchronized.
-
-    """
-    pipeline_model_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
-    args = get_args()
-    if args.split_model_parallel != 0:
-        forward_backward_func = forward_backward_split
-    elif pipeline_model_parallel_size > 1:
-        forward_backward_func = forward_backward_pipelining_without_interleaving
-    else:
-        forward_backward_func = forward_backward_no_pipelining
-    return forward_backward_func
-
 def deallocate_output_tensor(out, deallocate_pipeline_outputs=False):
     '''Pseudo-deallocate (i.e., set to scalar) the output tensor's '.data' field.
 
@@ -311,6 +201,7 @@ def backward_step(grad_scaler, input_tensor, output_tensor,
 
     return input_tensor_grad
 
+# caller see pipeline/schedules.py
 def forward_backward_split(*,
                             forward_step_func,
                             data_iterator: Union[Iterator, List[Iterator]],
@@ -407,7 +298,7 @@ def forward_backward_split(*,
                                     timers, collect_non_loss_data, dtype, enable_autocast)
     set_activationagent_warmup(False)
 
-    if model.language_model.layers_forward:
+    if model.module.module.language_model.encoder.layers_forward:
         output_tensor = forward_step(forward_step_func, data_iterator,
                                          model, num_microbatches, input_tensor, forward_data_store,
                                          timers, collect_non_loss_data, dtype, enable_autocast)
