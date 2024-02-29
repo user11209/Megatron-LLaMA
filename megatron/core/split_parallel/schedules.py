@@ -13,7 +13,10 @@ from megatron.core.pipeline_parallel import p2p_communication
 from megatron.core.enums import ModelType
 from megatron.core.utils import get_attr_wrapped_model, get_model_type
 
-from .activation_agent import ActivationAgent, set_activationagent_warmup
+from .activation_agent import ActivationAgent, set_activationagent_warmup, identify_activation_agent_role, get_activation_agent
+
+import code
+import time
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -65,7 +68,7 @@ def custom_backward(output, grad_output):
     Variable._execution_engine.run_backward(
         tensors = (output,),
         grad_tensors = (grad_output,),
-        keep_graph = False,
+        keep_graph = True,
         create_graph = False,
         inputs = tuple(),
         allow_unreachable=True,
@@ -174,7 +177,7 @@ def backward_step(grad_scaler, input_tensor, output_tensor,
     if deallocate_pipeline_outputs:
         custom_backward(output_tensor[0], output_tensor_grad[0])
     else:
-        torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
+        torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0], retain_graph=True)
 
     # Collect the grad of the input_tensor.
     input_tensor_grad = [None]
@@ -221,6 +224,7 @@ def forward_backward_split(*,
                             grad_sync_func: Optional[Callable] = None, # unused
                             param_sync_func: Optional[Callable] = None, # unused
                             optimizer=None):
+    get_activation_agent().ping_pong_check(info=3, tag="forward_backward_split")
     #! preparation before forwarding and backwarding
     #TODO by zhang: check whether all parts can be directly used
     if optimizer is not None:
@@ -292,13 +296,22 @@ def forward_backward_split(*,
     forward_data_store = []
 
     #TODO by zhang: forwarding and backwarding
+    identify_activation_agent_role()
     set_activationagent_warmup(True)
     output_tensor = forward_step(forward_step_func, data_iterator,
                                     model, num_microbatches, input_tensor, forward_data_store,
                                     timers, collect_non_loss_data, dtype, enable_autocast)
     set_activationagent_warmup(False)
+    # if parallel_state.get_split_model_parallel_rank() == 0:
+    #     with open("/Megatron-LLaMA/examples_of_zhang/log/log_0.txt", "w") as log_file:
+    #         log_file.write(str(get_activation_agent().id2obj_dict))
+    # else:
+    #     with open("/Megatron-LLaMA/examples_of_zhang/log/log_1.txt", "w") as log_file:
+    #         log_file.write(str(get_activation_agent().id2obj_dict))
+    # time.sleep(10)
+    assert 0
 
-    if model.module.module.language_model.encoder.layers_forward:
+    if parallel_state.get_split_model_parallel_rank() == 0:
         output_tensor = forward_step(forward_step_func, data_iterator,
                                          model, num_microbatches, input_tensor, forward_data_store,
                                          timers, collect_non_loss_data, dtype, enable_autocast)

@@ -15,6 +15,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_split_model_parallel_world_size,
 )
 
 from .utils import (
@@ -173,6 +174,33 @@ def model_parallel_cuda_manual_seed(seed):
                                 tensor_model_parallel_seed)
 
 
+def check_rng_state(tag = ""):
+    if get_tensor_model_parallel_rank() != 0:
+        return
+    log_dir_name = "/Megatron-LLaMA/examples_of_zhang/log"
+    import os
+    if not os.path.exists(os.path.join(log_dir_name, "rng_log")):
+        os.mkdir(os.path.join(log_dir_name, "rng_log"))
+    with open(os.path.join(log_dir_name, "log_recorder.txt"), "r") as record_file:
+        log_count = int(record_file.readline())
+    with open(os.path.join(log_dir_name, "log_recorder.txt"), "w") as record_file:
+        record_file.write(str(log_count + 1))
+    
+    if log_count >= 100:
+        return
+    with open(os.path.join(log_dir_name, "rng_log", str(log_count)+".txt"), "w") as rng_log_file:
+        cpu_rng_state = torch.get_rng_state()
+        cuda_rng_state = torch.cuda.get_rng_state()
+        cuda_rng_state_tracker = get_cuda_rng_tracker().get_states()[_MODEL_PARALLEL_RNG_TRACKER_NAME]
+
+        def hash_func(state):
+            return torch.sum((255-state)*241)
+
+        log_str = tag + "\n============ cpu state ===========\n" + str(hash_func(cpu_rng_state))
+        log_str +=      "\n=========== cuda state ===========\n" + str(hash_func(cuda_rng_state))
+        log_str +=      "\n========== tracker state =========\n" + str(hash_func(cuda_rng_state))
+        rng_log_file.write(log_str)
+
 class CheckpointFunction(torch.autograd.Function):
     """This function is adapted from torch.utils.checkpoint with
        two main changes:
@@ -249,5 +277,9 @@ class CheckpointFunction(torch.autograd.Function):
 def checkpoint(function, distribute_saved_activations, *args):
     """Checkpoint a model or part of the model.
     This has been directly copied from torch.utils.checkpoint."""
-    return CheckpointFunction.apply(function,
+    if get_split_model_parallel_world_size() > 1:
+        import megatron.core.split_parallel as split_parallel
+        return split_parallel.checkpoint(function, distribute_saved_activations, *args)
+    else:
+        return CheckpointFunction.apply(function,
                                     distribute_saved_activations, *args)

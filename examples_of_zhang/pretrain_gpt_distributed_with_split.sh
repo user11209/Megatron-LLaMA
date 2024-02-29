@@ -26,8 +26,7 @@ DISTRIBUTED_ARGS="
 "
 
 GPT_ARGS="
-    --pipeline-model-parallel-size 2 \
-    --split-model-parallel 1\
+    --split-model-parallel-size 2 \
     --num-layers 24 \
     --hidden-size 1024 \
     --num-attention-heads 16 \
@@ -43,7 +42,10 @@ GPT_ARGS="
     --weight-decay 1e-2 \
     --lr-warmup-fraction .01 \
     --clip-grad 1.0 \
-    --fp16
+    --fp16 \
+    --recompute-activations \
+        --recompute-granularity full \
+        --recompute-num-layers 1
 "
 
 DATA_ARGS="

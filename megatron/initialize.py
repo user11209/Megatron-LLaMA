@@ -21,6 +21,7 @@ from megatron.global_vars import set_global_variables
 from megatron.model.transformer import bias_dropout_add_fused_train
 from megatron.model.fused_bias_gelu import bias_gelu
 
+from megatron.core.split_parallel.activation_agent import init_activation_agent, get_activation_agent
 
 def initialize_megatron(extra_args_provider=None, args_defaults={},
                         ignore_unknown_args=False, allow_no_cuda=False):
@@ -171,10 +172,17 @@ def _initialize_distributed():
                 args.local_rank = device
             torch.cuda.set_device(device)
     # Call the init process
-    torch.distributed.init_process_group(
-        backend=args.distributed_backend,
-        world_size=args.world_size, rank=args.rank,
-        timeout=timedelta(minutes=args.distributed_timeout_minutes))
+    if args.split_model_parallel_size == 1:
+        torch.distributed.init_process_group(
+            backend=args.distributed_backend,
+            world_size=args.world_size, rank=args.rank,
+            timeout=timedelta(minutes=args.distributed_timeout_minutes))
+    else:
+        init_activation_agent()
+        torch.distributed.init_process_group(
+            backend=args.distributed_backend,
+            world_size=2*args.world_size, rank=args.rank,
+            timeout=timedelta(minutes=args.distributed_timeout_minutes))
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
@@ -182,8 +190,11 @@ def _initialize_distributed():
         if mpu.model_parallel_is_initialized():
             print('model parallel is already initialized')
         else:
+            if args.split_model_parallel_size != 1 and args.transformer_impl != "local":
+                raise RuntimeError("we do not support split model parallel to use transformer_engine.")
             mpu.initialize_model_parallel(args.tensor_model_parallel_size,
                                            args.pipeline_model_parallel_size,
+                                           args.split_model_parallel_size,
                                            args.virtual_pipeline_model_parallel_size,
                                            args.pipeline_model_parallel_split_rank)
             if args.rank == 0:

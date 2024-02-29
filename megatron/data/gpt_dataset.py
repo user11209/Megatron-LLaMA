@@ -395,7 +395,8 @@ def _build_index_mappings(name, data_prefix, documents, sizes,
     torch.distributed.all_reduce(counts, group=mpu.get_pipeline_model_parallel_group())
     assert counts[0].item() == (
         torch.distributed.get_world_size() //
-        torch.distributed.get_world_size(group=mpu.get_tensor_model_parallel_group()))
+        torch.distributed.get_world_size(group=mpu.get_tensor_model_parallel_group()) //
+        torch.distributed.get_world_size(group=mpu.get_split_model_parallel_group()))
 
     # Load mappings.
     start_time = time.time()

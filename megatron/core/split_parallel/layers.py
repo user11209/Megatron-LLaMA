@@ -30,7 +30,6 @@ from .mappings import (
     reduce_scatter_to_sequence_parallel_region,
 )
 
-from .random import get_cuda_rng_tracker
 from .utils import (
     divide,
     split_tensor_along_last_dim,
@@ -88,7 +87,7 @@ def _initialize_affine_weight_gpu(weight, init_method,
                                          is_parallel=True,
                                          dim=partition_dim,
                                          stride=stride)
-
+    from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
     with get_cuda_rng_tracker().fork():
         init_method(weight)
 

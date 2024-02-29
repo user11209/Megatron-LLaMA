@@ -18,6 +18,8 @@ from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.model.rotary_pos_embedding import apply_rotary_pos_emb
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
 
+from megatron.core.tensor_parallel.random import check_rng_state
+
 try:
     from einops import rearrange
 except ImportError:
@@ -923,14 +925,7 @@ class NoopTransformerLayer(MegatronModule):
 
 def _get_num_layers(args, is_encoder_and_decoder_model, is_decoder=False):
     """Compute the number of transformer layers resident on the current rank."""
-    if args.split_model_parallel != 0:
-        #? by zhang: only temporary, disable pipeline parallel. pipeline_model_parallel_world_size is necessarily 2, namely 1 GPU for forwarding, 1 GPU for backwarding. pipeline model parallel rank distinguishes the two GPUs.
-        assert mpu.get_pipeline_model_parallel_world_size() == 2
-        if not is_decoder:
-            num_layers = args.encoder_num_layers
-        else:
-            num_layers = args.decoder_num_layers
-    elif mpu.get_pipeline_model_parallel_world_size() > 1:
+    if mpu.get_pipeline_model_parallel_world_size() > 1:
         if is_encoder_and_decoder_model:
             assert args.pipeline_model_parallel_split_rank is not None
 
@@ -1128,16 +1123,6 @@ class ParallelTransformer(MegatronModule):
             # disconnect the input tensor from the output tensor.
             self.num_layers = 1
             self.layers = torch.nn.ModuleList([ NoopTransformerLayer(1) ])
-        elif args.split_model_parallel != 0:
-            print("[Debug by zhang]: doing split model parallel. set this at megatron/arguments.py:L959")
-            self.layers = torch.nn.ModuleList(
-                [build_layer(i + 1) for i in range(self.num_layers)])
-            #? by zhang: temporarily only support 2 GPUs, one for forwarding, one for backwarding. use pipeline parallel rank to distinguish the two GPUs.
-            split_rank = mpu.get_pipeline_model_parallel_rank()
-            if split_rank == 0:
-                self.layers_forward = True
-            else:
-                self.layers_forward = False
         else:
             self.layers = torch.nn.ModuleList(
                 [build_layer(i + 1 + offset) for i in range(self.num_layers)])
