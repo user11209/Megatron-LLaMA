@@ -2,6 +2,9 @@
 
 """Pretrain GPT"""
 
+import warnings
+warnings.filterwarnings("ignore", message="Failed to load image Python extension:")
+
 import torch
 from functools import partial
 from megatron import get_args

@@ -11,6 +11,7 @@ from .utils import GlobalMemoryBuffer
 _TENSOR_MODEL_PARALLEL_GROUP = None
 # forward-backward split model parallel group that the current rank belongs to.
 _SPLIT_MODEL_PARALLEL_GROUP = None
+_SPLIT_MODEL_PARALLEL_GROUP_CPU = None
 # Inter-layer model parallel group that the current rank belongs to.
 _PIPELINE_MODEL_PARALLEL_GROUP = None
 # Model parallel group (both intra- and pipeline) that the current rank belongs to.
@@ -46,6 +47,10 @@ _POSITION_EMBEDDING_GLOBAL_RANKS = None
 # A list of global ranks for each pipeline group to ease calculation of the source
 # rank when broadcasting from the first or last pipeline stage.
 _PIPELINE_GLOBAL_RANKS = None
+
+# A list of global ranks for each split_model_parallel group to ease calculation of the source
+# rank when broadcasting from the first or last pipeline stage.
+_SPLIT_GLOBAL_RANKS = None
 
 # A list of global ranks for each data parallel group to ease calculation of the source
 # rank when broadcasting weights from src to all other data parallel ranks
@@ -210,14 +215,23 @@ def initialize_model_parallel(
     global _SPLIT_MODEL_PARALLEL_GROUP
     assert _SPLIT_MODEL_PARALLEL_GROUP is None, \
         'split model parallel group is already initialized'
+    global _SPLIT_MODEL_PARALLEL_GROUP_CPU
+    assert _SPLIT_MODEL_PARALLEL_GROUP_CPU is None, \
+        'split model parallel group on cpu is already initialized'
+    global _SPLIT_GLOBAL_RANKS
+    assert _SPLIT_GLOBAL_RANKS is None, \
+        'split model parallel group global rank is already initialized'
     # parent process in range(0, world_size), activation agent subprocess in range(world_size, 2*world_size)
     # initialize them both
     for i in range(num_split_model_parallel_groups):
         ranks = range(i * split_model_parallel_size,
                       (i + 1) * split_model_parallel_size)
         group = torch.distributed.new_group(ranks)
+        group_cpu = torch.distributed.new_group(ranks, backend="gloo")
         if rank in ranks:
             _SPLIT_MODEL_PARALLEL_GROUP = group
+            _SPLIT_MODEL_PARALLEL_GROUP_CPU = group_cpu
+            _SPLIT_GLOBAL_RANKS = ranks
 
     # Build the pipeline model-parallel groups and embedding groups
     # (first and last rank in each pipeline model-parallel group).
@@ -325,6 +339,13 @@ def get_split_model_parallel_group():
     assert _SPLIT_MODEL_PARALLEL_GROUP is not None, \
         'forward_backward split model parallel group is not initialized'
     return _SPLIT_MODEL_PARALLEL_GROUP
+
+
+def get_split_model_parallel_group_cpu():
+    """Get the split model parallel gloo(cpu) group the caller rank belongs to."""
+    assert _SPLIT_MODEL_PARALLEL_GROUP_CPU is not None, \
+        'forward_backward split model parallel group cpu is not initialized'
+    return _SPLIT_MODEL_PARALLEL_GROUP_CPU
 
 
 def get_pipeline_model_parallel_group():
@@ -626,6 +647,20 @@ def get_pipeline_model_parallel_prev_rank():
     rank_in_pipeline = get_pipeline_model_parallel_rank()
     world_size = get_pipeline_model_parallel_world_size()
     return _PIPELINE_GLOBAL_RANKS[(rank_in_pipeline - 1) % world_size]
+
+
+def get_split_model_parallel_forward_rank():
+    """Return the global rank that serves as the forwarder in the split group"""
+    assert _SPLIT_GLOBAL_RANKS is not None, \
+        "Split parallel group global rank is not initialized"
+    return _SPLIT_GLOBAL_RANKS[0]
+
+
+def get_split_model_parallel_backward_ranks():
+    """Return the global ranks that serve as the backwarder in the split group, a list"""
+    assert _SPLIT_GLOBAL_RANKS is not None, \
+        "Split parallel group is not initialized"
+    return _SPLIT_GLOBAL_RANKS[1:]
 
 
 def get_data_parallel_world_size():

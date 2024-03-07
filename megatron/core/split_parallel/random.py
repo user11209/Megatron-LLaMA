@@ -18,6 +18,7 @@ from megatron.core.parallel_state import (
 )
 
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
+from megatron.core.tensor_parallel.random import _set_cuda_rng_state
 
 from .utils import (
     split_tensor_into_1d_equal_chunks,
@@ -48,13 +49,13 @@ class SplitCheckpointFunction(torch.autograd.Function):
 
         # Copy the rng states.
         activation_agent = get_activation_agent()
-        if is_activationagent_warmup():
-            fwd_cpu_rng_state_num = activation_agent.add_tensor_buffer_like("fwd_cpu_rng_state", fwd_cpu_rng_state)
-            fwd_cuda_rng_state_num = activation_agent.add_tensor_buffer_like("fwd_cuda_rng_state", fwd_cuda_rng_state)
-            fwd_cuda_rng_state_tracker_num = activation_agent.add_tensor_buffer_like("fwd_cuda_rng_state_tracker", fwd_cuda_rng_state_tracker)
-            ctx.num_dict = {"fwd_cpu_rng_state": fwd_cpu_rng_state_num, 
-                            "fwd_cuda_rng_state": fwd_cuda_rng_state_num, 
-                            "fwd_cuda_rng_state_tracker": fwd_cuda_rng_state_tracker_num}
+
+        fwd_cpu_rng_state_num = activation_agent.add_tensor_buffer_like("fwd_cpu_rng_state", fwd_cpu_rng_state)
+        fwd_cuda_rng_state_num = activation_agent.add_tensor_buffer_like("fwd_cuda_rng_state", fwd_cuda_rng_state)
+        fwd_cuda_rng_state_tracker_num = activation_agent.add_tensor_buffer_like("fwd_cuda_rng_state_tracker", fwd_cuda_rng_state_tracker)
+        ctx.num_dict = {"fwd_cpu_rng_state": fwd_cpu_rng_state_num, 
+                        "fwd_cuda_rng_state": fwd_cuda_rng_state_num, 
+                        "fwd_cuda_rng_state_tracker": fwd_cuda_rng_state_tracker_num}
         
         activation_agent.set_tensor(ctx.num_dict["fwd_cpu_rng_state"], fwd_cpu_rng_state)
         activation_agent.set_tensor(ctx.num_dict["fwd_cuda_rng_state"], fwd_cuda_rng_state)
@@ -74,17 +75,17 @@ class SplitCheckpointFunction(torch.autograd.Function):
         # Store everything.
         ctx.arg_list_without_tensor = list(map(lambda x: None if isinstance(x, torch.Tensor) else x, args))
         ctx.num_dict["args"] = []
+        ctx.req_grad = []
         for arg_index, arg in enumerate(args):
             if isinstance(arg, torch.Tensor):
-                if is_activationagent_warmup():
-                    arg_name = activation_agent.add_tensor_buffer_like(str(arg_index), arg)
-                    ctx.num_dict["args"].append(arg_name)
-                else:
-                    arg_name = ctx.num_dict["args"][arg_index]
+                arg_name = activation_agent.add_tensor_buffer_like(str(arg_index), arg)
+                ctx.num_dict["args"].append(arg_name)
+                ctx.req_grad.append(arg.requires_grad)
+
                 activation_agent.set_tensor(arg_name, arg)
             else:
-                if is_activationagent_warmup():
-                    ctx.num_dict["args"].append(None)
+                ctx.num_dict["args"].append(None)
+                ctx.req_grad.append(False)
 
         return outputs
 
@@ -126,6 +127,9 @@ class SplitCheckpointFunction(torch.autograd.Function):
         get_cuda_rng_tracker().set_states(fwd_cuda_rng_state_tracker)
 
         # Compute the forward pass.
+        for (inp, req_grad) in zip(inputs, ctx.req_grad):
+            if req_grad:
+                inp.requires_grad = True
         detached_inputs = detach_variable(inputs)
         with torch.enable_grad():
             outputs = ctx.run_function(*detached_inputs)
