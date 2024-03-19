@@ -1,6 +1,8 @@
 # Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
 
-"""Pretrain GPT"""
+"""Pretrain transformer for debugging"""
+import sys
+sys.path.append("/Megatron-LLaMA")
 
 import warnings
 warnings.filterwarnings("ignore", message="Failed to load image Python extension:")

@@ -19,6 +19,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tensor_model_parallel_group,
+    get_split_model_parallel_world_size,
     get_global_memory_buffer,
 )
 from .mappings import (
@@ -30,7 +31,6 @@ from .mappings import (
     reduce_scatter_to_sequence_parallel_region,
 )
 
-from .random import get_cuda_rng_tracker
 from .utils import (
     divide,
     split_tensor_along_last_dim,
@@ -88,7 +88,7 @@ def _initialize_affine_weight_gpu(weight, init_method,
                                          is_parallel=True,
                                          dim=partition_dim,
                                          stride=stride)
-
+    from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
     with get_cuda_rng_tracker().fork():
         init_method(weight)
 
@@ -469,7 +469,7 @@ class ColumnParallelLinear(torch.nn.Module):
         self.output_size = output_size
         self.gather_output = gather_output
         # Divide the weight matrix along the last dimension.
-        world_size = get_tensor_model_parallel_world_size()
+        world_size = get_split_model_parallel_world_size() - 1
         self.output_size_per_partition = divide(output_size, world_size)
         self.skip_bias_add = skip_bias_add
 
@@ -633,7 +633,7 @@ class RowParallelLinear(torch.nn.Module):
         self.output_size = output_size
         self.input_is_parallel = input_is_parallel
         # Divide the weight matrix along the last dimension.
-        world_size = get_tensor_model_parallel_world_size()
+        world_size = get_split_model_parallel_world_size() - 1
         self.input_size_per_partition = divide(input_size, world_size)
         self.skip_bias_add = skip_bias_add
         self.gradient_accumulation_fusion = gradient_accumulation_fusion

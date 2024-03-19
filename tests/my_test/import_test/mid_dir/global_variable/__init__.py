@@ -1,0 +1,1 @@
+from .some_variable import print_n_increase_global, print_global , _GLOBAL_VAR

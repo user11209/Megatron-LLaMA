@@ -15,6 +15,8 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_split_model_parallel_world_size,
+    get_split_model_parallel_rank,
 )
 
 from .utils import (
@@ -25,8 +27,12 @@ from .utils import (
 from megatron.core.utils import safely_set_viewless_tensor_data
 
 # Default name for the model parallel rng tracker.
-_MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
+_MODEL_PARALLEL_RNG_TRACKER_NAME_BASE = 'model-parallel-rng'
+_MODEL_PARALLEL_RNG_TRACKER_NAME = None
 
+def get_model_parallel_rng_tracker_name():
+    global _MODEL_PARALLEL_RNG_TRACKER_NAME
+    return _MODEL_PARALLEL_RNG_TRACKER_NAME
 
 def _set_cuda_rng_state(new_state, device=-1):
     """Sets the random number generator state of the current GPU.
@@ -116,6 +122,9 @@ class CudaRNGStatesTracker:
     def fork(self, name=_MODEL_PARALLEL_RNG_TRACKER_NAME):
         """Fork the cuda rng state, perform operations, and exit with
         the original state."""
+        if name == None:
+            global _MODEL_PARALLEL_RNG_TRACKER_NAME
+            name = _MODEL_PARALLEL_RNG_TRACKER_NAME
         # Check if we have added the state
         if name not in self.states_:
             raise Exception('cuda rng state {} is not added'.format(name))
@@ -161,7 +170,6 @@ def model_parallel_cuda_manual_seed(seed):
     """
     # 2718 is just for fun and any POSITIVE value will work.
     offset = seed + 2718
-    tensor_model_parallel_seed = offset + get_tensor_model_parallel_rank()
     # Data parallel gets the original seed.
     data_parallel_seed = seed
 
@@ -169,9 +177,56 @@ def model_parallel_cuda_manual_seed(seed):
     # Set the default state.
     torch.cuda.manual_seed(data_parallel_seed)
     # and model parallel state.
-    _CUDA_RNG_STATE_TRACKER.add(_MODEL_PARALLEL_RNG_TRACKER_NAME,
+    global _MODEL_PARALLEL_RNG_TRACKER_NAME
+    if get_split_model_parallel_world_size() == 1:
+        # when split model parallel is not activated, fall back to the old method.
+        _MODEL_PARALLEL_RNG_TRACKER_NAME = _MODEL_PARALLEL_RNG_TRACKER_NAME_BASE
+        tensor_model_parallel_seed = offset + get_tensor_model_parallel_rank()
+        _CUDA_RNG_STATE_TRACKER.add(_MODEL_PARALLEL_RNG_TRACKER_NAME,
                                 tensor_model_parallel_seed)
+    else:
+        split_world_size = get_split_model_parallel_world_size()
+        split_rank = get_split_model_parallel_rank()
+        print("by zhang: {} trying to set _MODEL_PARALLEL_RNG_TRACKER_NAME!".format(split_rank))
+        if split_rank != 0:
+            _MODEL_PARALLEL_RNG_TRACKER_NAME = _MODEL_PARALLEL_RNG_TRACKER_NAME_BASE + str(split_rank-1)
+        else:
+            _MODEL_PARALLEL_RNG_TRACKER_NAME = []
+            for backward_index in range(split_world_size-1):
+                _MODEL_PARALLEL_RNG_TRACKER_NAME.append(_MODEL_PARALLEL_RNG_TRACKER_NAME_BASE + str(backward_index))
+            # NOTE: the forward GPU of split model parallel should not use default tracker name!
+        for backward_index in range(split_world_size-1):
+            tensor_model_parallel_seed = offset + backward_index
+            _CUDA_RNG_STATE_TRACKER.add(_MODEL_PARALLEL_RNG_TRACKER_NAME_BASE + str(backward_index),
+                                    tensor_model_parallel_seed)
 
+
+def check_rng_state(tag = ""):
+    if get_tensor_model_parallel_rank() != 0:
+        return
+    log_dir_name = "/Megatron-LLaMA/examples_of_zhang/log"
+    import os
+    if not os.path.exists(os.path.join(log_dir_name, "rng_log")):
+        os.mkdir(os.path.join(log_dir_name, "rng_log"))
+    with open(os.path.join(log_dir_name, "log_recorder.txt"), "r") as record_file:
+        log_count = int(record_file.readline())
+    with open(os.path.join(log_dir_name, "log_recorder.txt"), "w") as record_file:
+        record_file.write(str(log_count + 1))
+    
+    if log_count >= 100:
+        return
+    with open(os.path.join(log_dir_name, "rng_log", str(log_count)+".txt"), "w") as rng_log_file:
+        cpu_rng_state = torch.get_rng_state()
+        cuda_rng_state = torch.cuda.get_rng_state()
+        cuda_rng_state_tracker = get_cuda_rng_tracker().get_states()[_MODEL_PARALLEL_RNG_TRACKER_NAME]
+
+        def hash_func(state):
+            return torch.sum((255-state)*241)
+
+        log_str = tag + "\n============ cpu state ===========\n" + str(hash_func(cpu_rng_state))
+        log_str +=      "\n=========== cuda state ===========\n" + str(hash_func(cuda_rng_state))
+        log_str +=      "\n========== tracker state =========\n" + str(hash_func(cuda_rng_state))
+        rng_log_file.write(log_str)
 
 class CheckpointFunction(torch.autograd.Function):
     """This function is adapted from torch.utils.checkpoint with
@@ -249,5 +304,9 @@ class CheckpointFunction(torch.autograd.Function):
 def checkpoint(function, distribute_saved_activations, *args):
     """Checkpoint a model or part of the model.
     This has been directly copied from torch.utils.checkpoint."""
-    return CheckpointFunction.apply(function,
+    if get_split_model_parallel_world_size() > 1:
+        import megatron.core.split_parallel as split_parallel
+        return split_parallel.checkpoint(function, distribute_saved_activations, *args)
+    else:
+        return CheckpointFunction.apply(function,
                                     distribute_saved_activations, *args)

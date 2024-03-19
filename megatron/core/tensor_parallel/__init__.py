@@ -4,6 +4,7 @@ from .data import broadcast_data
 from .layers import (
     ColumnParallelLinear,
     RowParallelLinear,
+    RowChunkedLinear,
     VocabParallelEmbedding,
     set_tensor_model_parallel_attributes,
     set_defaults_if_not_set_tensor_model_parallel_attributes,
@@ -22,6 +23,7 @@ from .mappings import (
 )
 
 from .random import (
+    get_model_parallel_rng_tracker_name,
     checkpoint,
     get_cuda_rng_tracker,
     model_parallel_cuda_manual_seed,
@@ -41,6 +43,7 @@ __all__ = [
     #layers.py
     "ColumnParallelLinear",
     "RowParallelLinear",
+    "RowChunkedLinear"
     "VocabParallelEmbedding",
     "set_tensor_model_parallel_attributes",
     "set_defaults_if_not_set_tensor_model_parallel_attributes",
@@ -55,6 +58,7 @@ __all__ = [
     "scatter_to_tensor_model_parallel_region",
     "scatter_to_sequence_parallel_region",
     # random.py
+    "get_model_parallel_rng_tracker_name",
     "checkpoint",
     "get_cuda_rng_tracker",
     "model_parallel_cuda_manual_seed",
