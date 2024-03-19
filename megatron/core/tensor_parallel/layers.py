@@ -19,6 +19,8 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tensor_model_parallel_group,
+    get_split_model_parallel_world_size,
+    get_split_model_parallel_rank,
     get_global_memory_buffer,
 )
 from .mappings import (
@@ -30,12 +32,14 @@ from .mappings import (
     reduce_scatter_to_sequence_parallel_region,
 )
 
-from .random import get_cuda_rng_tracker
+from .random import get_cuda_rng_tracker, get_model_parallel_rng_tracker_name
 from .utils import (
     divide,
     split_tensor_along_last_dim,
     VocabUtility,
 )
+
+from .logging import store_mid_tensor
 
 _grad_accum_fusion_available = True
 try:
@@ -81,7 +85,7 @@ def copy_tensor_model_parallel_attributes(destination_tensor, source_tensor):
 
 
 def _initialize_affine_weight_gpu(weight, init_method,
-                                  partition_dim, stride=1):
+                                  partition_dim, stride=1, tracker_id=None):
     """Initialize affine weight for model parallel on GPU."""
 
     set_tensor_model_parallel_attributes(tensor=weight,
@@ -89,8 +93,16 @@ def _initialize_affine_weight_gpu(weight, init_method,
                                          dim=partition_dim,
                                          stride=stride)
 
-    with get_cuda_rng_tracker().fork():
-        init_method(weight)
+    rng_tracker_name = get_model_parallel_rng_tracker_name()
+    if tracker_id == None:
+        assert isinstance(rng_tracker_name, str), "TRACKER_NAME is not str at rank {}, it is actually {}".format(get_split_model_parallel_rank(), rng_tracker_name)
+        with get_cuda_rng_tracker().fork():
+            init_method(weight)
+    else:
+        assert isinstance(rng_tracker_name, list), "TRACKER_NAME is not list at rank {}, it is actually {}".format(get_split_model_parallel_rank(), rng_tracker_name)
+        init_tracker_name = rng_tracker_name[tracker_id]
+        with get_cuda_rng_tracker().fork(init_tracker_name):
+            init_method(weight)
 
 
 def _initialize_affine_weight_cpu(weight, output_size, input_size,
@@ -173,6 +185,7 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         # Allocate weights and initialize.
         if use_cpu_initialization:
+            assert get_split_model_parallel_world_size() == 1, "You cannot use cpu initialization when using split model parallel!"
             self.weight = Parameter(torch.empty(
                 self.num_embeddings_per_partition, self.embedding_dim,
                 dtype=params_dtype))
@@ -186,8 +199,17 @@ class VocabParallelEmbedding(torch.nn.Module):
                 self.num_embeddings_per_partition, self.embedding_dim,
                 device=torch.cuda.current_device(), dtype=params_dtype))
             if perform_initialization:
-                _initialize_affine_weight_gpu(self.weight, init_method,
-                                              partition_dim=0, stride=1)
+                split_world_size = get_split_model_parallel_world_size()
+                if split_world_size > 1 and get_split_model_parallel_rank() == 0:
+                    for chunk_id in range(split_world_size - 1):
+                        chunk_size = (self.num_embeddings_per_partition-1) // (split_world_size-1) + 1
+                        s = chunk_id*chunk_size
+                        e = min((chunk_id+1)*chunk_size, self.num_embeddings_per_partition)
+                        _initialize_affine_weight_gpu(self.weight[s:e], init_method,
+                                                    partition_dim=0, stride=1, tracker_id=chunk_id)
+                else:
+                    _initialize_affine_weight_gpu(self.weight, init_method,
+                                                partition_dim=0, stride=1)
 
     def forward(self, input_):
         if self.tensor_model_parallel_size > 1:
@@ -461,6 +483,8 @@ class ColumnParallelLinear(torch.nn.Module):
                  perform_initialization=True,
                  gradient_accumulation_fusion=False,
                  sequence_parallel_enabled: bool = False,
+                 split_parallel_chunked: bool = False,
+                 tracker_id = None,
                  ):
         super(ColumnParallelLinear, self).__init__()
 
@@ -469,7 +493,10 @@ class ColumnParallelLinear(torch.nn.Module):
         self.output_size = output_size
         self.gather_output = gather_output
         # Divide the weight matrix along the last dimension.
-        world_size = get_tensor_model_parallel_world_size()
+        if split_parallel_chunked:
+            world_size = get_split_model_parallel_world_size() - 1
+        else:
+            world_size = get_tensor_model_parallel_world_size()
         self.output_size_per_partition = divide(output_size, world_size)
         self.skip_bias_add = skip_bias_add
 
@@ -492,7 +519,7 @@ class ColumnParallelLinear(torch.nn.Module):
                 device=torch.cuda.current_device(), dtype=params_dtype))
             if perform_initialization:
                 _initialize_affine_weight_gpu(self.weight, init_method,
-                                              partition_dim=0, stride=stride)
+                                              partition_dim=0, stride=stride, tracker_id=tracker_id)
 
         if bias:
             if use_cpu_initialization:
@@ -705,12 +732,160 @@ class RowParallelLinear(torch.nn.Module):
             async_grad_allreduce=False,
             sequence_parallel_enabled=False,
         )
+        store_mid_tensor("row_split_matmul_output", output_parallel)
 
         # All-reduce across all the partitions.
         if self.sequence_parallel_enabled:
             output_ = reduce_scatter_to_sequence_parallel_region(output_parallel)
         else:
             output_ = reduce_from_tensor_model_parallel_region(output_parallel)
+        
+        store_mid_tensor("row_split_reduced_output", output_)
+        if not self.skip_bias_add:
+            output = output_ + self.bias if self.bias is not None else output_
+            output_bias = None
+        else:
+            output = output_
+            output_bias = self.bias
+        return output, output_bias
+
+
+class RowChunkedLinear(torch.nn.Module):
+    """Linear layer with row chunking. NOTE, the chunked matmul's are not parallelized,
+    but executed sequentially on a single device.
+
+    The linear layer is defined as Y = XA + b. A is chunked along
+    its first dimension and X along its second dimension as:
+               -   -
+              | A_1 |
+              | .   |
+          A = | .   |        X = [X_1, ..., X_p]
+              | .   |
+              | A_p |
+               -   -
+    Arguments:
+        input_size: first dimension of matrix A. 
+            NOTE, is the full size instead of the input tensor's size.
+        output_size: second dimension of matrix A.
+
+    Keyword Arguments:
+        bias: If true, add bias. Note that bias is not parallelized.
+        input_is_parallel: If true, we assume that the input is already
+                           split across the GPUs and we do not split
+                           again. NOTE, necessarily True here!
+        init_method: method to initialize weights. Note that bias is always set
+                     to zero.
+        stride: For the strided linear layers.
+        keep_master_weight_for_test: This was added for testing and should be
+                                     set to False. It returns the master weights
+                                     used for initialization.
+        skip_bias_add: This was added to enable performance optimization where bias
+                       can be fused with other elementwise operations. We skip
+                       adding bias but instead return it.
+        params_dtype:
+        use_cpu_initialization:
+        perform_initialization:
+        gradient_accumulation_fusion:
+        sequence_parallel_enabled: NOTE, necessarily False here.
+    """
+
+    def __init__(self, input_size, output_size, *,
+                 bias=True, input_is_parallel=False,
+                 init_method=init.xavier_normal_, stride=1,
+                 keep_master_weight_for_test=False,
+                 skip_bias_add=False,
+                 params_dtype=torch.float32,
+                 use_cpu_initialization=False,
+                 perform_initialization=True,
+                 gradient_accumulation_fusion=False,
+                 sequence_parallel_enabled: bool = False,
+                 chunk_num = 0,
+                 ):
+        super(RowChunkedLinear, self).__init__()
+
+        # Keep input parameters
+        self.input_size = input_size
+        self.output_size = output_size
+        self.input_is_parallel = input_is_parallel
+        self.chunk_num = chunk_num if chunk_num != 0 else get_split_model_parallel_world_size()-1
+        # Divide the weight matrix along the last dimension.
+        world_size = self.chunk_num
+        self.input_size_per_partition = divide(input_size, world_size)
+        self.skip_bias_add = skip_bias_add
+        self.gradient_accumulation_fusion = gradient_accumulation_fusion
+        self.sequence_parallel_enabled = sequence_parallel_enabled
+        assert sequence_parallel_enabled == False, \
+            "RowChunkedLinear use sequential execution, and don't support sequence parallel yet."
+        assert input_is_parallel == True, \
+            "`input_is_parallel` is more precisely `input_is_chunked`, need to be true."
+        assert use_cpu_initialization == None, \
+            "these labels are not properly set. RowChunkedLinear does not support it yet."
+        if self.sequence_parallel_enabled and not self.input_is_parallel:
+            raise RuntimeError("To enable `sequence_parallel_enabled`, `input_is_parallel` must be `True`")
+
+        # Parameters.
+        # Note: torch.nn.functional.linear performs XA^T + b and as a result
+        # we allocate the transpose.
+        # Initialize weight.
+        self.weight = []
+        for chunk_id in range(self.chunk_num):
+            chunked_weight = Parameter(torch.empty(
+                                    self.output_size, self.input_size_per_partition,
+                                    device=torch.cuda.current_device(), dtype=params_dtype))
+            if perform_initialization:
+                _initialize_affine_weight_gpu(chunked_weight, init_method,
+                                                partition_dim=1, stride=stride, tracker_id=chunk_id)
+            self.weight.append(chunked_weight)
+        if bias:
+            self.bias = Parameter(torch.empty(
+                self.output_size, device=torch.cuda.current_device(),
+                dtype=params_dtype))
+            setattr(self.bias, 'sequence_parallel', sequence_parallel_enabled)
+
+            # Always initialize bias to zero.
+            with torch.no_grad():
+                self.bias.zero_()
+        else:
+            self.register_parameter('bias', None)
+
+
+
+    def forward(self, input_):
+        """Forward of RowParallelLinear
+
+        Args:
+            input_: 3D tensor whose order of dimension is [sequence, batch, hidden]
+                NOTE, `input_` here should be a tensor list of size `chunk_num`.
+
+        Returns:
+            - output
+            - bias
+        """
+        # Set up backprop all-reduce.
+        assert self.input_is_parallel
+        assert isinstance(input_, list) and len(input_) == self.chunk_num, \
+            "the number of input list must be the same as chunks"
+
+        output_ = None
+        for chunk_id in range(self.chunk_num):
+            input_parallel = input_[chunk_id]
+            # Matrix multiply.
+            output_parallel = linear_with_grad_accumulation_and_async_allreduce(
+                input=input_parallel,
+                weight=self.weight[chunk_id],
+                bias=None,
+                gradient_accumulation_fusion=self.gradient_accumulation_fusion,
+                async_grad_allreduce=False,
+                sequence_parallel_enabled=False,
+            )
+            store_mid_tensor("row_split_matmul_output", output_parallel)
+            # Sum-up across all the partitions.
+            if output_ == None:
+                output_ = output_parallel
+            else:
+                output_ += output_parallel
+
+        store_mid_tensor("row_split_reduced_output", output_)
         if not self.skip_bias_add:
             output = output_ + self.bias if self.bias is not None else output_
             output_bias = None

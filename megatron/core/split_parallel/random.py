@@ -20,10 +20,10 @@ from megatron.core.parallel_state import (
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.tensor_parallel.random import _set_cuda_rng_state
 
-from .utils import (
-    split_tensor_into_1d_equal_chunks,
-    gather_split_1d_tensor,
-)
+# from .utils import (
+#     split_tensor_into_1d_equal_chunks,
+#     gather_split_1d_tensor,
+# )
 
 from megatron.core.utils import safely_set_viewless_tensor_data
 
@@ -67,10 +67,12 @@ class SplitCheckpointFunction(torch.autograd.Function):
         # Divide hidden states across model parallel group and only keep
         # the chunk corresponding to the current rank.
         if distribute_saved_activations:
-            ctx.input_0_shape = args[0].data.shape
-            safely_set_viewless_tensor_data(
-                args[0],
-                split_tensor_into_1d_equal_chunks(args[0].data, new_buffer=True))
+            #! currently disable this.
+            assert 0
+            # ctx.input_0_shape = args[0].data.shape
+            # safely_set_viewless_tensor_data(
+            #     args[0],
+            #     split_tensor_into_1d_equal_chunks(args[0].data, new_buffer=True))
 
         # Store everything.
         ctx.arg_list_without_tensor = list(map(lambda x: None if isinstance(x, torch.Tensor) else x, args))
@@ -109,9 +111,11 @@ class SplitCheckpointFunction(torch.autograd.Function):
         inputs = tuple(inputs)
 
         if ctx.distribute_saved_activations:
-            safely_set_viewless_tensor_data(
-                inputs[0],
-                gather_split_1d_tensor(inputs[0].data).view(ctx.input_0_shape))
+            #! temporarily disable this
+            assert 0
+            # safely_set_viewless_tensor_data(
+            #     inputs[0],
+            #     gather_split_1d_tensor(inputs[0].data).view(ctx.input_0_shape))
 
         # Store the current states.
         bwd_cpu_rng_state = torch.get_rng_state()

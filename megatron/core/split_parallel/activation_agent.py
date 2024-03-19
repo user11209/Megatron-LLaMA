@@ -11,7 +11,8 @@ from megatron.core.parallel_state import (
     get_split_model_parallel_rank,
     get_split_model_parallel_world_size,
     get_global_memory_buffer,
-    initialize_model_parallel
+    initialize_model_parallel,
+    destroy_model_parallel,
 )
 
 import time
@@ -28,7 +29,7 @@ _ACTIVATION_AGENT = None
 _WARMUP_ACTIVATION_AGENT = False
 
 #* function for the subprocess
-def subprocess_schedule_buffer_transfer(some_zero, args, p2c_pipe, p_c_queue, c_p_queue, current_device):
+def subprocess_schedule_buffer_transfer(some_zero, args, p2c_pipe, p_c_queue, c_p_queue, current_device, init_only):
   parallel_rank = 500
   try:
     torch.cuda.set_device(current_device)
@@ -59,6 +60,17 @@ def subprocess_schedule_buffer_transfer(some_zero, args, p2c_pipe, p_c_queue, c_
 
     parallel_rank = torch.distributed.get_rank()
     split_parallel_rank = torch.distributed.get_rank(activation_comm_group)
+
+    if args.debug_split_parallel:
+      # Don't send anything. This is for debugging.
+      loop_count = 0
+      while True:
+        loop_count += 1
+        if loop_count < 100:
+          time.sleep(9)
+        else:
+          destroy_model_parallel()
+          return
 
     if split_parallel_rank == 0:
       while True:
@@ -194,13 +206,15 @@ def subprocess_schedule_buffer_transfer(some_zero, args, p2c_pipe, p_c_queue, c_
           c_p_queue.put(buffer_id)
 
           do_log(parallel_rank, "    successfully wrote ", buffer_id)
+    destroy_model_parallel()
   except Exception as e:
-    do_log(parallel_rank, "something went wrong: ", repr(e))
+    import traceback
+    do_log(parallel_rank, "something went wrong: ", traceback.format_exc(e))
   return
 
 #TODO: each agent should belong to a layer. when a layer produces a tensor to be send, it is passed to ActivationAgent with a buffer name, it will be sent to the partner agent. the agent owns a subprocess(on init), which share tensor buffer with its parentprocess. One problem is, share memory tensors should be created before subprocesses are created, so they need to be created before transformer layers are called. That means it's necessary to fetch the tensor buffer before calling the layer and write the calculated values to the buffer directly.
 class ActivationAgent:
-  def __init__(self):
+  def __init__(self, init_only=False):
 
     self.id2obj_dict = {}
     self.assign_id_offset = 0
@@ -214,7 +228,7 @@ class ActivationAgent:
 
     # start the subprocess before torch.distributed.init_process_group
     self.schedule_subprocess = mp.spawn(subprocess_schedule_buffer_transfer, \
-                                          args=(args, p2c_pipe_c, self.p_c_queue, self.c_p_queue, torch.cuda.current_device()), join=False)
+                                          args=(args, p2c_pipe_c, self.p_c_queue, self.c_p_queue, torch.cuda.current_device(), init_only), join=False)
 
   def identify_activation_agent_role(self):
     self.is_sender_agent = (get_split_model_parallel_rank() == 0)
@@ -435,10 +449,10 @@ class ActivationAgent:
     
 
 
-def init_activation_agent():
+def init_activation_agent(init_only=False):
   #TODO: confirm its is_sender_agent and partner_rank, where to do this
   global _ACTIVATION_AGENT
-  _ACTIVATION_AGENT = ActivationAgent()
+  _ACTIVATION_AGENT = ActivationAgent(init_only)
   pass
 
 def get_activation_agent():

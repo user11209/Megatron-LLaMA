@@ -15,9 +15,11 @@ from megatron.core.utils import get_attr_wrapped_model, get_model_type
 
 from .activation_agent import ActivationAgent, set_activationagent_warmup, identify_activation_agent_role, get_activation_agent
 from . import p2p_communication as split_p2p_communication
+from .logging import do_log
 
 import code
 import time
+import os
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -365,6 +367,126 @@ def forward_backward_split(*,
             grad_sync_func(model.parameters())
 
     return forward_data_store
+
+
+def forward_backward_split_debug(*,
+                            forward_step_func,
+                            data_iterator: Union[Iterator, List[Iterator]],
+                            model: Union[torch.nn.Module, List[torch.nn.Module]],
+                            num_microbatches: int,
+                            dtype: torch.dtype,
+                            tensor_shape: Optional[Shape] = None, # unused
+                            decoder_seq_length: Optional[int] = None, # unused
+                            grad_scaler: Callable = None,
+                            sequence_parallel: bool = False, # unused
+                            forward_only: bool = False,
+                            timers: Callable = None,
+                            collect_non_loss_data: bool = False,
+                            enable_autocast: bool = False,
+                            deallocate_pipeline_outputs: bool = False,
+                            no_sync_func: Optional[Callable] = None,
+                            grad_sync_func: Optional[Callable] = None, # unused
+                            param_sync_func: Optional[Callable] = None, # unused
+                            optimizer=None):
+    get_activation_agent().ping_pong_check(tag="forward_backward_split")
+    #! preparation before forwarding and backwarding
+    #TODO by zhang: check whether all parts can be directly used
+    if optimizer is not None:
+        optimizer.gather_parameters(skip_if_not_stepped=True)
+
+    if isinstance(model, list):
+        assert len(model) == 1, \
+            "non-interleaved pipeline parallelism does not support model chunking"
+        model = model[0]
+    if isinstance(data_iterator, list):
+        assert len(data_iterator) == 1, \
+            "non-pipeline-parallel schedule does not support model chunking"
+        data_iterator = data_iterator[0]
+
+    # Disable async grad reductions
+    if no_sync_func is None and isinstance(model, torchDDP):
+        no_sync_func = model.no_sync
+    if no_sync_func is None:
+        no_sync_func = contextlib.nullcontext
+    no_sync_context = None
+    def disable_grad_sync():
+        """Disable asynchronous grad reductions"""
+        nonlocal no_sync_context
+        if no_sync_context is None:
+            no_sync_context = no_sync_func()
+            no_sync_context.__enter__()
+    def enable_grad_sync():
+        """Enable asynchronous grad reductions"""
+        nonlocal no_sync_context
+        if no_sync_context is not None:
+            no_sync_context.__exit__(None, None, None)
+            no_sync_context = None
+    disable_grad_sync()
+
+    # Compute number of warmup microbatches.
+    # num_warmup_microbatches = \
+    #     (parallel_state.get_pipeline_model_parallel_world_size() -
+    #      parallel_state.get_pipeline_model_parallel_rank() - 1)
+    num_warmup_microbatches = 1
+    num_warmup_microbatches = min(
+        num_warmup_microbatches,
+        num_microbatches)
+    num_microbatches_remaining = \
+        num_microbatches - num_warmup_microbatches
+
+    model_type = get_model_type(model)
+
+    forward_data_store = []
+    input_tensor, output_tensor_grad = None, None
+
+    split_rank = parallel_state.get_split_model_parallel_rank()
+
+    # Input, output tensors only need to be saved when doing backward passes
+    input_tensors = None
+    output_tensors = None
+    if not forward_only:
+        input_tensors = []
+        output_tensors = []
+    forward_data_store = []
+
+    #TODO by zhang: forwarding and backwarding
+    identify_activation_agent_role()
+    # this function may be repeatedly called. make sure this does not cause a failure.
+    set_activationagent_warmup(True)
+    output_tensor = forward_step(forward_step_func, data_iterator,
+                                    model, num_microbatches, input_tensor, forward_data_store,
+                                    timers, collect_non_loss_data, dtype, enable_autocast)
+    set_activationagent_warmup(False)
+    print("[rank ", split_rank, "]: finish warmup.")
+
+    log_dir_name = "/Megatron-LLaMA/examples_of_zhang/log/log_"+str(split_rank)
+    if not os.path.exists(log_dir_name):
+        os.mkdir(log_dir_name)
+    for id2obj_id, id2obj_obj in get_activation_agent().id2obj_dict.items():
+        do_log(split_rank, "checking id", id2obj_id)
+        if isinstance(id2obj_obj, dict):
+            if "buffer" in id2obj_obj:
+                reserved = id2obj_obj["buffer"][0]
+                save_path = os.path.join(log_dir_name, str(id2obj_id)+str(".pt"))
+                torch.save(reserved, save_path)
+                do_log(split_rank, "    checked, is storage. value stored at", save_path)
+            else:
+                do_log(split_rank, "    checked, is intermediate index, value is", id2obj_obj)
+        else:
+            do_log(split_rank, "    checked, is not dict, should not happen. Checking:", id2obj_obj)
+        
+    #! by zhang: cleanup after forwarding and backwarding
+    #TODO by zhang: check whether all parts can be directly used
+    if optimizer is not None:
+        optimizer.record_grad_accumulation_boundary()
+    # Launch any remaining grad reductions
+    if no_sync_context is not None:
+        enable_grad_sync()
+        if grad_sync_func is not None:
+            grad_sync_func(model.parameters())
+
+    return forward_data_store
+
 
 def forward_backward_no_pipelining(*,
                                    forward_step_func,

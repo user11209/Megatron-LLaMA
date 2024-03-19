@@ -43,9 +43,9 @@ GPT_ARGS="
     --lr-warmup-fraction .01 \
     --clip-grad 1.0 \
     --fp16 \
-    --recompute-activations \
-        --recompute-granularity full \
-        --recompute-num-layers 1
+    --recompute-granularity full \
+    --recompute-method uniform \
+    --recompute-num-layers 1
 "
 
 DATA_ARGS="

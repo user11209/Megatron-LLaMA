@@ -70,7 +70,8 @@ def validate_args(args, defaults={}):
     )
     # Checks.
     model_parallel_size = args.pipeline_model_parallel_size * \
-                          args.tensor_model_parallel_size
+                          args.tensor_model_parallel_size * \
+                          args.split_model_parallel_size
     assert args.world_size % model_parallel_size == 0, 'world size is not'\
         ' divisible by tensor parallel size ({}) times pipeline parallel ' \
         'size ({})'.format(args.world_size, args.tensor_model_parallel_size,
@@ -959,6 +960,8 @@ def _add_distributed_args(parser):
     group.add_argument('--split-model-parallel-size', type=int, default=1,
                        help='use split model parallel which split forward and backward. '
                        '1 for disable, >1 for enable. developed by zhang.')
+    group.add_argument('--debug-split-parallel', action="store_true",
+                        default=False, help='this is only used for debugging. developed by zhang.')
     group.add_argument('--model-parallel-size', type=int, default=None,
                        help='Old model parallel argument, do not use. Use '
                        '--tensor-model-parallel-size instead.')

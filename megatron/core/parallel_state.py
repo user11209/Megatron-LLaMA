@@ -11,7 +11,10 @@ from .utils import GlobalMemoryBuffer
 _TENSOR_MODEL_PARALLEL_GROUP = None
 # forward-backward split model parallel group that the current rank belongs to.
 _SPLIT_MODEL_PARALLEL_GROUP = None
+# auxilary forward-backward split model parallel group that the current rank belongs to.
+# _CPU for activation agent to send/recv rng_states on cpu. _FOR_BACKWARD for backward gpus to do all-reduce.
 _SPLIT_MODEL_PARALLEL_GROUP_CPU = None
+_SPLIT_MODEL_PARALLEL_GROUP_FOR_BACKWARD = None
 # Inter-layer model parallel group that the current rank belongs to.
 _PIPELINE_MODEL_PARALLEL_GROUP = None
 # Model parallel group (both intra- and pipeline) that the current rank belongs to.
@@ -201,17 +204,20 @@ def initialize_model_parallel(
         if rank in ranks:
             _MODEL_PARALLEL_GROUP = group
 
+    # if no split_model_parallel allowed, init this as normal. else, init this later with split_model_parallel_group
     # Build the tensor model-parallel groups.
     global _TENSOR_MODEL_PARALLEL_GROUP
     assert _TENSOR_MODEL_PARALLEL_GROUP is None, \
         'tensor model parallel group is already initialized'
-    for i in range(num_tensor_model_parallel_groups):
-        ranks = range(i * tensor_model_parallel_size,
-                      (i + 1) * tensor_model_parallel_size)
-        group = torch.distributed.new_group(ranks)
-        if rank in ranks:
-            _TENSOR_MODEL_PARALLEL_GROUP = group
+    if split_model_parallel_size == 1:
+        for i in range(num_tensor_model_parallel_groups):
+            ranks = range(i * tensor_model_parallel_size,
+                        (i + 1) * tensor_model_parallel_size)
+            group = torch.distributed.new_group(ranks)
+            if rank in ranks:
+                _TENSOR_MODEL_PARALLEL_GROUP = group
 
+    # Build the split model-parallel groups
     global _SPLIT_MODEL_PARALLEL_GROUP
     assert _SPLIT_MODEL_PARALLEL_GROUP is None, \
         'split model parallel group is already initialized'
@@ -225,13 +231,24 @@ def initialize_model_parallel(
     # initialize them both
     for i in range(num_split_model_parallel_groups):
         ranks = range(i * split_model_parallel_size,
-                      (i + 1) * split_model_parallel_size)
+                    (i + 1) * split_model_parallel_size)
         group = torch.distributed.new_group(ranks)
         group_cpu = torch.distributed.new_group(ranks, backend="gloo")
         if rank in ranks:
             _SPLIT_MODEL_PARALLEL_GROUP = group
             _SPLIT_MODEL_PARALLEL_GROUP_CPU = group_cpu
             _SPLIT_GLOBAL_RANKS = ranks
+        #* if split model parallel is allowed, tensor model parallel group is initialized here!
+        if split_model_parallel_size != 1:
+            ranks_forward = [i * split_model_parallel_size]
+            ranks_backward = range(i * split_model_parallel_size + 1,
+                                (i + 1) * split_model_parallel_size)
+            group_forward = torch.distributed.new_group(ranks_forward)
+            group_backward = torch.distributed.new_group(ranks_backward)
+            if rank in ranks_forward:
+                _TENSOR_MODEL_PARALLEL_GROUP = group_forward
+            if rank in ranks_backward:
+                _TENSOR_MODEL_PARALLEL_GROUP = group_backward
 
     # Build the pipeline model-parallel groups and embedding groups
     # (first and last rank in each pipeline model-parallel group).
@@ -595,8 +612,18 @@ def get_tensor_model_parallel_src_rank():
     """Calculate the global rank corresponding to the first local rank
     in the tensor model parallel group."""
     global_rank = torch.distributed.get_rank()
+    split_world_size = get_split_model_parallel_world_size()
     local_world_size = get_tensor_model_parallel_world_size()
-    return (global_rank // local_world_size) * local_world_size
+    if split_world_size > 1:
+        if local_world_size == 1:
+            return global_rank
+        elif local_world_size == split_world_size-1:
+            return (global_rank // split_world_size) * split_world_size + 1
+        else:
+            assert 0, "using split model parallel, but tensor parallel size not matching! \
+                        rank {}, t({}) v.s. s({})".format(global_rank, local_world_size, split_world_size)
+    else:
+        return (global_rank // local_world_size) * local_world_size
 
 
 def get_split_model_parallel_src_rank():
@@ -692,6 +719,10 @@ def destroy_model_parallel():
     _TENSOR_MODEL_PARALLEL_GROUP = None
     global _SPLIT_MODEL_PARALLEL_GROUP
     _SPLIT_MODEL_PARALLEL_GROUP = None
+    global _SPLIT_MODEL_PARALLEL_GROUP_CPU
+    _SPLIT_MODEL_PARALLEL_GROUP_CPU = None
+    global _SPLIT_MODEL_PARALLEL_GROUP_FOR_BACKWARD
+    _SPLIT_MODEL_PARALLEL_GROUP_FOR_BACKWARD = None
     global _PIPELINE_MODEL_PARALLEL_GROUP
     _PIPELINE_MODEL_PARALLEL_GROUP = None
     global _DATA_PARALLEL_GROUP
