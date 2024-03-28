@@ -214,6 +214,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
        args.virtual_pipeline_model_parallel_size is not None:
         assert model_type != ModelType.encoder_and_decoder, \
             "Interleaved schedule not supported for model with both encoder and decoder"
+        assert args.split_model_parallel_size == 1, \
+            "Using interleaved schedule with split_model_parallel is not supported."
         model = []
         for i in range(args.virtual_pipeline_model_parallel_size):
             mpu.set_virtual_pipeline_model_parallel_rank(i)
@@ -232,6 +234,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         add_encoder = True
         add_decoder = True
         if model_type == ModelType.encoder_and_decoder:
+            assert 0, "Split model parallel not supported for model with both encoder and decoder."
             if mpu.get_pipeline_model_parallel_world_size() > 1:
                 assert args.pipeline_model_parallel_split_rank is not None, \
                     "Split rank needs to be specified for model with both encoder and decoder"
@@ -251,7 +254,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         else:
             model = model_provider_func(
                 pre_process=pre_process,
-                post_process=post_process
+                post_process=post_process,
+                manual_pre_process=args.manual_pre_post_process,
+                manual_post_process=args.manual_pre_post_process
             )
         model.model_type = model_type
 

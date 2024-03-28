@@ -13,9 +13,9 @@ from megatron.core.pipeline_parallel import p2p_communication
 from megatron.core.enums import ModelType
 from megatron.core.utils import get_attr_wrapped_model, get_model_type
 
-from .activation_agent import ActivationAgent, set_activationagent_warmup, identify_activation_agent_role, get_activation_agent
+from .activation_agent import ActivationAgent, set_activationagent_warmup, get_activation_agent
 from . import p2p_communication as split_p2p_communication
-from .logging import do_log
+from megatron.core.tensor_parallel.logging import do_log
 
 import code
 import time
@@ -318,9 +318,7 @@ def forward_backward_split(*,
         output_tensors = []
     forward_data_store = []
 
-    #TODO by zhang: forwarding and backwarding
-    identify_activation_agent_role()
-    # this function may be repeatedly called. make sure this does not cause a failure.
+    #* forwarding and backwarding
     set_activationagent_warmup(True)
     output_tensor = forward_step(forward_step_func, data_iterator,
                                     model, num_microbatches, input_tensor, forward_data_store,
@@ -369,7 +367,217 @@ def forward_backward_split(*,
     return forward_data_store
 
 
-def forward_backward_split_debug(*,
+
+
+
+def forward_step_preprocess(forward_step_func,
+                 data_iterator,
+                 model,
+                 timers,
+                 forward_stage_io,
+                 autocast_dtype=torch.float,
+                 enable_autocast=False):
+    """
+    preprocess of the model. including dataloader and VocabParallelEmbedding.
+    """
+    if timers is not None:
+        timers('forward-compute', log_level=2).start()
+
+    parallel_state.set_vocab_selective_split_parallel(True)
+
+    if enable_autocast:
+        context_manager = torch.autocast("cuda", dtype=autocast_dtype)
+    else:
+        context_manager = contextlib.nullcontext()
+
+    assert len(forward_stage_io) == 0, "forward_stage_io is not empty at preprocess stage! {}".format(forward_stage_io)
+    #@note somehow parallel_state.is_pipeline_last_stage() also need this.
+    # for split_parallel_rank == 0 and pipeline_parallel_rank == last and pipeline_world_size > 1, \
+    # input for postprocess will be None. Best way is to force preprocess here.
+    if parallel_state.is_pipeline_first_stage():
+        with context_manager:
+            output_tensor = forward_step_func.preprocess(data_iterator, model, do_vocab_embedding=True)
+            output_tensor_detach = output_tensor.detach()
+            output_tensor_detach.requires_grad = True
+
+        forward_stage_io["preprocess"] = [None, output_tensor]
+    else:
+        with context_manager:
+            output_tensor_detach = forward_step_func.preprocess(data_iterator, model, do_vocab_embedding=False)
+
+    parallel_state.set_vocab_selective_split_parallel(False)
+    return output_tensor_detach
+
+def forward_step_main(forward_step_func,
+                 model,
+                 input_tensor,
+                 timers,
+                 forward_stage_io,
+                 autocast_dtype=torch.float,
+                 enable_autocast=False):
+    """
+    main process of the model, without preprocessing and postprocessing.
+    Note, input_tensor is the return value of forward_step_pre_process or is passed from the former pipeline stage.
+    """
+    set_input_tensor = get_attr_wrapped_model(model, "set_input_tensor")
+    if len(forward_stage_io) != 1:
+        assert len(forward_stage_io) == 0, \
+            "len(forward_stage_io) == {}, which is not allowed at forward_step_main."
+        assert input_tensor != None, \
+            "forward_step_main need to get input tensor somewhere, "\
+            "currently we have empty forward_stage_io and empty input_tensor."
+    set_input_tensor(input_tensor)
+
+    if enable_autocast:
+        context_manager = torch.autocast("cuda", dtype=autocast_dtype)
+    else:
+        context_manager = contextlib.nullcontext()
+    with context_manager:
+        output_tensor = forward_step_func.main_process(model)
+        output_tensor_detach = output_tensor.detach()
+        output_tensor_detach.requires_grad = True
+
+    forward_stage_io["main"] = [input_tensor, output_tensor]
+    return output_tensor_detach
+
+def forward_step_postprocess(forward_step_func,
+                              model,
+                              input_tensor,
+                              forward_stage_io,
+                              forward_data_store,
+                              num_microbatches,
+                              timers,
+                              collect_non_loss_data=False,
+                              autocast_dtype=torch.float,
+                              enable_autocast=False):
+    """
+    postprocess of the model. including lm_logit and loss.
+    Note, input_tensor must be the output of forward_step_main.
+    """
+    output_tensor = None
+    if parallel_state.is_pipeline_last_stage():
+        assert input_tensor != None, \
+            "at least provide something to tell what lm_output is like, need to build all-reduce buffer."
+
+        if enable_autocast:
+            context_manager = torch.autocast("cuda", dtype=autocast_dtype)
+        else:
+            context_manager = contextlib.nullcontext()
+        
+        parallel_state.set_vocab_selective_split_parallel(True)
+        with context_manager:
+            output_tensor, loss_func = forward_step_func.postprocess(model, input_tensor)
+        parallel_state.set_vocab_selective_split_parallel(False)
+
+        if not collect_non_loss_data:
+            output_tensor = loss_func(output_tensor)
+            loss, loss_reduced = output_tensor
+            output_tensor = loss / num_microbatches
+            forward_data_store.append(loss_reduced)
+        else:
+            data = loss_func(output_tensor, non_loss_data=True)
+            forward_data_store.append(data)
+
+        # If T5 model (or other model with encoder and decoder)
+        # and in decoder stack, then send encoder_hidden_state
+        # downstream as well.
+        model_type = get_model_type(model)
+
+        forward_stage_io["postprocess"] = [input_tensor, output_tensor]
+
+        assert not model_type == ModelType.encoder_and_decoder, \
+            "please note, split model parallel does not support encoder_and_decoder like model yet."
+        # please note, the return below is not necessary.
+        if parallel_state.is_pipeline_stage_after_split() and \
+                model_type == ModelType.encoder_and_decoder:
+            return [output_tensor, input_tensor[-1]]
+    
+    if timers is not None:
+        timers('forward-compute').stop()
+    return output_tensor
+
+def backward_step_one_stage(grad_scaler,
+                            input_tensor,
+                            output_tensor,
+                            output_tensor_grad,
+                            timers,
+                            deallocate_pipeline_outputs=False):
+    """backward process of the postprocess stage."""
+    if timers is not None:
+        timers('backward-compute', log_level=2).start()
+
+    if input_tensor != None:
+        input_tensor.retain_grad()
+    if output_tensor_grad is None and grad_scaler is not None:
+        output_tensor = grad_scaler(output_tensor)
+
+    if deallocate_pipeline_outputs:
+        custom_backward(output_tensor[0], output_tensor_grad[0])
+    else:
+        torch.autograd.backward(output_tensor, grad_tensors=output_tensor_grad)
+
+    if input_tensor != None:
+        input_tensor_grad = input_tensor.grad
+    else:
+        input_tensor_grad = None
+    return input_tensor_grad
+
+def backward_step_pre_process(grad_scaler, 
+                              forward_stage_io, 
+                              output_tensor_grad, 
+                              model_type, 
+                              timers, 
+                              deallocate_pipeline_outputs=False):
+    if timers is not None:
+        timers('backward-compute', log_level=2).start()
+
+    #@todo backward of preprocess is not necessarily called for some pipeline_parallel_rank.
+    assert model_type != ModelType.encoder_and_decoder, \
+        "split_model_parallel currently doesn't support encoder_and_decoder."
+    parallel_state.set_vocab_selective_split_parallel(True)
+    input_tensor = None
+    output_tensor = forward_stage_io["preprocess"][1]
+    input_tensor_grad = backward_step_one_stage(grad_scaler, input_tensor, output_tensor, 
+                        output_tensor_grad, timers, deallocate_pipeline_outputs)
+    parallel_state.set_vocab_selective_split_parallel(False)
+    return None
+
+def backward_step_main(grad_scaler, 
+                       forward_stage_io, 
+                       output_tensor_grad, 
+                       model_type, 
+                       timers, 
+                       deallocate_pipeline_outputs=False):
+    assert model_type != ModelType.encoder_and_decoder, \
+        "split_model_parallel currently doesn't support encoder_and_decoder."
+    input_tensor = forward_stage_io["main"][0]
+    output_tensor = forward_stage_io["main"][1]
+    input_tensor_grad = backward_step_one_stage(grad_scaler, input_tensor, output_tensor, 
+                        output_tensor_grad, timers, deallocate_pipeline_outputs)
+    return input_tensor_grad
+
+def backward_step_post_process(grad_scaler, 
+                               forward_stage_io, 
+                               output_tensor_grad, 
+                               model_type, 
+                               timers, 
+                               deallocate_pipeline_outputs=False):
+    #@todo backward of postprocess is not necessarily called for some pipeline_parallel_rank.
+    assert model_type != ModelType.encoder_and_decoder, \
+        "split_model_parallel currently doesn't support encoder_and_decoder."
+    parallel_state.set_vocab_selective_split_parallel(True)
+    input_tensor = forward_stage_io["postprocess"][0]
+    output_tensor = forward_stage_io["postprocess"][1]
+    input_tensor_grad = backward_step_one_stage(grad_scaler, input_tensor, output_tensor, 
+                        output_tensor_grad, timers, deallocate_pipeline_outputs)
+    parallel_state.set_vocab_selective_split_parallel(False)
+
+    if timers is not None:
+        timers('backward-compute', log_level=2).stop()
+    return input_tensor_grad
+
+# caller see pipeline/scheduler.py
+def forward_backward_split_selective(*,
                             forward_step_func,
                             data_iterator: Union[Iterator, List[Iterator]],
                             model: Union[torch.nn.Module, List[torch.nn.Module]],
@@ -388,6 +596,8 @@ def forward_backward_split_debug(*,
                             grad_sync_func: Optional[Callable] = None, # unused
                             param_sync_func: Optional[Callable] = None, # unused
                             optimizer=None):
+    assert parallel_state.get_split_model_parallel_world_size() > 1, \
+        "You can only use selective_split_parallel with split world_size > 1!"
     get_activation_agent().ping_pong_check(tag="forward_backward_split")
     #! preparation before forwarding and backwarding
     #TODO by zhang: check whether all parts can be directly used
@@ -439,42 +649,96 @@ def forward_backward_split_debug(*,
     forward_data_store = []
     input_tensor, output_tensor_grad = None, None
 
+    pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
+    recv_tensor_shapes = get_tensor_shapes(rank=pipeline_rank-1,
+                                           model_type=model_type,
+                                           tensor_shape=tensor_shape,
+                                           decoder_seq_length=decoder_seq_length,
+                                           sequence_parallel=sequence_parallel)
+    send_tensor_shapes = get_tensor_shapes(rank=pipeline_rank,
+                                           model_type=model_type,
+                                           tensor_shape=tensor_shape,
+                                           decoder_seq_length=decoder_seq_length,
+                                           sequence_parallel=sequence_parallel)
     split_rank = parallel_state.get_split_model_parallel_rank()
-
-    # Input, output tensors only need to be saved when doing backward passes
-    input_tensors = None
-    output_tensors = None
-    if not forward_only:
-        input_tensors = []
-        output_tensors = []
-    forward_data_store = []
+    if parallel_state.get_split_model_parallel_world_size() != 1:
+        seq_length, micro_batch_size, hidden_size = tensor_shape
+        split_grad_shape = [(micro_batch_size, hidden_size)]
 
     #TODO by zhang: forwarding and backwarding
-    identify_activation_agent_role()
-    # this function may be repeatedly called. make sure this does not cause a failure.
+    forward_stage_io = {}
+    forward_stage_io_last = {}
+    # do warmup-forward
     set_activationagent_warmup(True)
-    output_tensor = forward_step(forward_step_func, data_iterator,
-                                    model, num_microbatches, input_tensor, forward_data_store,
-                                    timers, collect_non_loss_data, dtype, enable_autocast)
+    preprocess_output = forward_step_preprocess(forward_step_func, data_iterator, model,
+                                                timers, forward_stage_io, dtype, enable_autocast)
+    if split_rank != 0:
+        main_output = forward_step_main(forward_step_func, model, preprocess_output, timers,
+                                        forward_stage_io, dtype, enable_autocast)
+    else:
+        main_output = torch.zeros_like(preprocess_output)
+        main_output.requires_grad = True
+    post_process_output = forward_step_postprocess(forward_step_func, model, main_output,
+                                                    forward_stage_io, forward_data_store, num_microbatches,
+                                                    timers, collect_non_loss_data, dtype, enable_autocast)
     set_activationagent_warmup(False)
-    print("[rank ", split_rank, "]: finish warmup.")
 
-    log_dir_name = "/Megatron-LLaMA/examples_of_zhang/log/log_"+str(split_rank)
-    if not os.path.exists(log_dir_name):
-        os.mkdir(log_dir_name)
-    for id2obj_id, id2obj_obj in get_activation_agent().id2obj_dict.items():
-        do_log(split_rank, "checking id", id2obj_id)
-        if isinstance(id2obj_obj, dict):
-            if "buffer" in id2obj_obj:
-                reserved = id2obj_obj["buffer"][0]
-                save_path = os.path.join(log_dir_name, str(id2obj_id)+str(".pt"))
-                torch.save(reserved, save_path)
-                do_log(split_rank, "    checked, is storage. value stored at", save_path)
-            else:
-                do_log(split_rank, "    checked, is intermediate index, value is", id2obj_obj)
+    for k in num_microbatches_remaining:
+        # symbol below: l-last, t-this, f-forward, b-backward, r-preprocess, m-main, o-postprocess
+        # each iteration contains: lbo-tfr-[lbm & tfm]-lbr-tfo
+        forward_stage_io_last = forward_stage_io
+        forward_stage_io = {}
+        # lbo
+        main_output_grad = backward_step_post_process(grad_scaler, forward_stage_io_last, None, model_type,
+                                                    timers, deallocate_pipeline_outputs)
+        # tfr
+        preprocess_output = forward_step_preprocess(forward_step_func, data_iterator, model,
+                                                    timers, forward_stage_io, dtype, enable_autocast)
+        if split_rank != 0:
+            # lbm
+            preprocess_output_grad = backward_step_main(grad_scaler, forward_stage_io_last, main_output_grad, model_type,
+                                                        timers, deallocate_pipeline_outputs)
+            main_output = torch.zeros_like(preprocess_output)
+            main_output.requires_grad = True
         else:
-            do_log(split_rank, "    checked, is not dict, should not happen. Checking:", id2obj_obj)
-        
+            # tfm
+            main_output = forward_step_main(forward_step_func, model, preprocess_output, timers,
+                                            forward_stage_io, dtype, enable_autocast)
+            preprocess_output_grad = torch.zeros_like(main_output_grad)
+        # lbr
+        backward_step_pre_process(grad_scaler, forward_stage_io_last, preprocess_output_grad, model_type,
+                                timers, deallocate_pipeline_outputs)
+        # tfo
+        post_process_output = forward_step_postprocess(forward_step_func, model, main_output,
+                                                        forward_stage_io, forward_data_store, num_microbatches,
+                                                        timers, collect_non_loss_data, dtype, enable_autocast)
+        print("[rank {}]: iteration {} forward/backward succeeded!".format(split_rank, k))
+
+    # do cooldown-backward
+    forward_stage_io_last = forward_stage_io
+    forward_stage_io = {}
+    main_output_grad = backward_step_post_process(grad_scaler, forward_stage_io_last, None, model_type,
+                                                timers, deallocate_pipeline_outputs)
+    if split_rank != 0:
+        preprocess_output_grad = backward_step_main(grad_scaler, forward_stage_io_last, main_output_grad, model_type,
+                                                    timers, deallocate_pipeline_outputs)
+    else:
+        preprocess_output_grad = torch.zeros_like(main_output_grad)
+    backward_step_pre_process(grad_scaler, forward_stage_io_last, preprocess_output_grad, model_type,
+                            timers, deallocate_pipeline_outputs)
+    
+
+
+    # if parallel_state.get_split_model_parallel_rank() == 0:
+    #     with open("/Megatron-LLaMA/examples_of_zhang/log/log_0.txt", "w") as log_file:
+    #         log_file.write(str(get_activation_agent().id2obj_dict))
+    # else:
+    #     with open("/Megatron-LLaMA/examples_of_zhang/log/log_1.txt", "w") as log_file:
+    #         log_file.write(str(get_activation_agent().id2obj_dict))
+
+
+    
+    time.sleep(20)
     #! by zhang: cleanup after forwarding and backwarding
     #TODO by zhang: check whether all parts can be directly used
     if optimizer is not None:
@@ -484,82 +748,6 @@ def forward_backward_split_debug(*,
         enable_grad_sync()
         if grad_sync_func is not None:
             grad_sync_func(model.parameters())
-
-    return forward_data_store
-
-
-def forward_backward_no_pipelining(*,
-                                   forward_step_func,
-                                   data_iterator: Union[Iterator, List[Iterator]],
-                                   model: Union[torch.nn.Module, List[torch.nn.Module]],
-                                   num_microbatches: int,
-                                   dtype: Optional[torch.dtype] = None,
-                                   tensor_shape: Optional[Shape] = None, # unused
-                                   decoder_seq_length: Optional[int] = None, # unused
-                                   grad_scaler: Callable = None,
-                                   sequence_parallel: bool = False, # unused
-                                   forward_only: bool = False,
-                                   timers: Callable = None,
-                                   collect_non_loss_data: bool = False,
-                                   enable_autocast: bool = False,
-                                   deallocate_pipeline_outputs: bool = False,
-                                   no_sync_func: Optional[Callable] = None,
-                                   grad_sync_func: Optional[Callable] = None, # unused
-                                   param_sync_func: Optional[Callable] = None, # unused
-                                   optimizer=None):
-    """Run forward and backward passes with no pipeline parallelism
-    (no inter-stage communication).
-
-    Returns dictionary with losses.
-
-
-    See get_forward_backward_func() for argument details
-    """
-
-    if optimizer is not None:
-        optimizer.gather_parameters(skip_if_not_stepped=True)
-
-    if isinstance(model, list):
-        assert len(model) == 1, \
-            "non-pipeline-parallel schedule does not support model chunking"
-        model = model[0]
-    if isinstance(data_iterator, list):
-        assert len(data_iterator) == 1, \
-            "non-pipeline-parallel schedule does not support model chunking"
-        data_iterator = data_iterator[0]
-
-    if no_sync_func is None and isinstance(model, torchDDP):
-        no_sync_func = model.no_sync
-    if no_sync_func is None:
-        no_sync_func = contextlib.nullcontext
-
-    model_type = get_model_type(model)
-
-    forward_data_store = []
-    input_tensor, output_tensor_grad = None, None
-    with no_sync_func():
-        for i in range(num_microbatches - 1):
-            output_tensor = forward_step(forward_step_func, data_iterator,
-                                         model, num_microbatches, input_tensor, forward_data_store,
-                                         timers, collect_non_loss_data, dtype, enable_autocast)
-            if not forward_only:
-                backward_step(grad_scaler, input_tensor, output_tensor,
-                              output_tensor_grad, model_type, timers, deallocate_pipeline_outputs)
-                if optimizer is not None:
-                    optimizer.backward_epilogue()
-
-    # Run computation for last microbatch out of context handler (want to
-    # synchronize gradients).
-    output_tensor = forward_step(forward_step_func, data_iterator,
-                                 model, num_microbatches, input_tensor, forward_data_store,
-                                 timers, collect_non_loss_data, dtype, enable_autocast)
-
-    if not forward_only:
-        backward_step(grad_scaler, input_tensor, output_tensor,
-                      output_tensor_grad, model_type, timers, deallocate_pipeline_outputs)
-        if optimizer is not None:
-            optimizer.backward_epilogue()
-            optimizer.record_grad_accumulation_boundary()
 
     return forward_data_store
 
@@ -687,193 +875,3 @@ def recv_split(tensor_shapes, dtype, timers):
             output_tensor_grads.append(split_p2p_communication.recv_split(tensor_shape, dtype,
                                                                        timers=timers))
     return output_tensor_grads
-
-def forward_backward_pipelining_without_interleaving(*,
-                                                     forward_step_func,
-                                                     data_iterator: Union[Iterator, List[Iterator]],
-                                                     model: Union[torch.nn.Module, List[torch.nn.Module]],
-                                                     num_microbatches: int,
-                                                     dtype: torch.dtype,
-                                                     tensor_shape: Shape,
-                                                     decoder_seq_length: Optional[int] = None,
-                                                     grad_scaler: Callable = None,
-                                                     sequence_parallel: bool = False,
-                                                     forward_only: bool = False,
-                                                     timers: Callable = None,
-                                                     collect_non_loss_data: bool = False,
-                                                     enable_autocast: bool = False,
-                                                     deallocate_pipeline_outputs: bool = False,
-                                                     no_sync_func: Optional[Callable] = None,
-                                                     grad_sync_func: Optional[Callable] = None,
-                                                     param_sync_func: Optional[Callable] = None, # unused
-                                                     optimizer=None
-                                                     ):
-    """Run non-interleaved 1F1B schedule, with communication between pipeline
-    stages.
-
-    Returns dictionary with losses if the last stage, empty dict otherwise."""
-
-    if optimizer is not None:
-        optimizer.gather_parameters(skip_if_not_stepped=True)
-
-    if isinstance(model, list):
-        assert len(model) == 1, \
-            "non-interleaved pipeline parallelism does not support model chunking"
-        model = model[0]
-    if isinstance(data_iterator, list):
-        assert len(data_iterator) == 1, \
-            "non-pipeline-parallel schedule does not support model chunking"
-        data_iterator = data_iterator[0]
-
-    # Disable async grad reductions
-    if no_sync_func is None and isinstance(model, torchDDP):
-        no_sync_func = model.no_sync
-    if no_sync_func is None:
-        no_sync_func = contextlib.nullcontext
-    no_sync_context = None
-    def disable_grad_sync():
-        """Disable asynchronous grad reductions"""
-        nonlocal no_sync_context
-        if no_sync_context is None:
-            no_sync_context = no_sync_func()
-            no_sync_context.__enter__()
-    def enable_grad_sync():
-        """Enable asynchronous grad reductions"""
-        nonlocal no_sync_context
-        if no_sync_context is not None:
-            no_sync_context.__exit__(None, None, None)
-            no_sync_context = None
-    disable_grad_sync()
-
-    # Compute number of warmup microbatches.
-    num_warmup_microbatches = \
-        (parallel_state.get_pipeline_model_parallel_world_size() -
-         parallel_state.get_pipeline_model_parallel_rank() - 1)
-    num_warmup_microbatches = min(
-        num_warmup_microbatches,
-        num_microbatches)
-    num_microbatches_remaining = \
-        num_microbatches - num_warmup_microbatches
-
-    model_type = get_model_type(model)
-
-    rank = parallel_state.get_pipeline_model_parallel_rank()
-    recv_tensor_shapes = get_tensor_shapes(rank=rank-1,
-                                           model_type=model_type,
-                                           tensor_shape=tensor_shape,
-                                           decoder_seq_length=decoder_seq_length,
-                                           sequence_parallel=sequence_parallel)
-    send_tensor_shapes = get_tensor_shapes(rank=rank,
-                                           model_type=model_type,
-                                           tensor_shape=tensor_shape,
-                                           decoder_seq_length=decoder_seq_length,
-                                           sequence_parallel=sequence_parallel)
-
-    # Input, output tensors only need to be saved when doing backward passes
-    input_tensors = None
-    output_tensors = None
-    if not forward_only:
-        input_tensors = []
-        output_tensors = []
-    forward_data_store = []
-
-    # Run warmup forward passes.
-    for i in range(num_warmup_microbatches):
-        input_tensor = recv_forward(recv_tensor_shapes, dtype, timers=timers)
-        output_tensor = forward_step(forward_step_func, data_iterator, model, num_microbatches,
-                                     input_tensor, forward_data_store,
-                                     timers, collect_non_loss_data, dtype, enable_autocast)
-        send_forward(output_tensor, send_tensor_shapes, timers=timers)
-
-        if not forward_only:
-            input_tensors.append(input_tensor)
-            output_tensors.append(output_tensor)
-            deallocate_output_tensor(output_tensor[0], deallocate_pipeline_outputs)
-
-    # Before running 1F1B, need to receive first forward tensor.
-    # If all microbatches are run in warmup / cooldown phase, then no need to
-    # receive this tensor here.
-    if num_microbatches_remaining > 0:
-        input_tensor = recv_forward(recv_tensor_shapes, dtype, timers=timers)
-
-    # Run 1F1B in steady state.
-    for i in range(num_microbatches_remaining):
-        last_iteration = (i == (num_microbatches_remaining - 1))
-
-        output_tensor = forward_step(forward_step_func, data_iterator, model, num_microbatches,
-                                     input_tensor, forward_data_store,
-                                     timers, collect_non_loss_data, dtype, enable_autocast)
-
-        if forward_only:
-            send_forward(output_tensor, send_tensor_shapes, timers=timers)
-
-            if not last_iteration:
-                input_tensor = recv_forward(recv_tensor_shapes, dtype, timers=timers)
-
-        else:
-            output_tensor_grad = \
-                send_forward_recv_backward(output_tensor,
-                                           send_tensor_shapes, dtype,
-                                           timers=timers)
-
-            # Add input_tensor and output_tensor to end of list.
-            input_tensors.append(input_tensor)
-            output_tensors.append(output_tensor)
-            deallocate_output_tensor(output_tensor[0], deallocate_pipeline_outputs)
-
-            # Pop input_tensor and output_tensor from the start of the list for
-            # the backward pass.
-            input_tensor = input_tensors.pop(0)
-            output_tensor = output_tensors.pop(0)
-
-            input_tensor_grad = \
-                backward_step(grad_scaler, input_tensor, output_tensor,
-                              output_tensor_grad, model_type, timers, deallocate_pipeline_outputs)
-
-            if optimizer is not None:
-                    optimizer.backward_epilogue()
-
-            if last_iteration:
-                input_tensor = None
-                send_backward(input_tensor_grad, recv_tensor_shapes, timers=timers)
-            else:
-                input_tensor = \
-                    send_backward_recv_forward(
-                        input_tensor_grad, recv_tensor_shapes, dtype, timers=timers)
-
-    # Run cooldown backward passes.
-    if not forward_only:
-        for i in range(num_warmup_microbatches):
-
-            # Enable async grad reduction in the last backward pass
-            # Note: If grad sync function is provided, only enable
-            # async grad reduction in first pipeline stage. Other
-            # pipeline stages do grad reduction during pipeline
-            # bubble.
-            if i == num_warmup_microbatches-1:
-                if grad_sync_func is None or rank == 0:
-                    enable_grad_sync()
-
-            input_tensor = input_tensors.pop(0)
-            output_tensor = output_tensors.pop(0)
-
-            output_tensor_grad = recv_backward(send_tensor_shapes, dtype, timers=timers)
-
-            input_tensor_grad = \
-                backward_step(grad_scaler, input_tensor, output_tensor,
-                              output_tensor_grad, model_type, timers, deallocate_pipeline_outputs)
-
-            if optimizer is not None:
-                    optimizer.backward_epilogue()
-
-            send_backward(input_tensor_grad, recv_tensor_shapes, timers=timers)
-
-    if optimizer is not None:
-        optimizer.record_grad_accumulation_boundary()
-    # Launch any remaining grad reductions
-    if no_sync_context is not None:
-        enable_grad_sync()
-        if grad_sync_func is not None:
-            grad_sync_func(model.parameters())
-
-    return forward_data_store

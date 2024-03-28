@@ -6,6 +6,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tensor_model_parallel_group,
+    is_rank_lm_output_master,
 )
 from .utils import split_tensor_along_last_dim
 
@@ -156,6 +157,45 @@ class _ReduceFromModelParallelRegion(torch.autograd.Function):
         return grad_output
 
 
+class _BroadcastToModelParallelRegion(torch.autograd.Function):
+    """Broadcast the input from one device to all other devices."""
+
+    @staticmethod
+    def symbolic(graph, input_):
+        return _reduce(input_)
+
+    @staticmethod
+    def forward(ctx, input_, broadcast_on_forward=True):
+        ctx.broadcast_on_forward = broadcast_on_forward
+        if broadcast_on_forward:
+            if not is_rank_lm_output_master():
+                with torch.no_grad():
+                    input_.zero_()
+        output = _reduce(input_)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        permute = False
+        if not grad_output.is_contiguous():
+            if grad_output.permute(1,0,2).is_contiguous():
+                grad_output = grad_output.permute(1,0,2)
+                permute = True
+            else:
+                print("cloning grad_output of broadcasting to contiguous region.")
+                grad_output = grad_output.contiguous()
+        broadcast_on_forward = ctx.broadcast_on_forward
+        if not broadcast_on_forward:
+            if not is_rank_lm_output_master(backward=True):
+                with torch.no_grad():
+                    grad_output.zero_()
+        grad_input = _reduce(grad_output)
+        if not permute:
+            return grad_input, None
+        else:
+            return grad_input.permute(1,0,2), None
+
+
 class _ScatterToModelParallelRegion(torch.autograd.Function):
     """Split the input and keep only the corresponding chuck to the rank."""
 
@@ -257,6 +297,10 @@ def copy_to_tensor_model_parallel_region(input_):
 def reduce_from_tensor_model_parallel_region(input_):
     return _ReduceFromModelParallelRegion.apply(input_)
 
+
+def broadcast_to_tensor_model_parallel_region(input_, broadcast_on_forward=True):
+    return _BroadcastToModelParallelRegion.apply(input_, broadcast_on_forward)
+    
 
 def scatter_to_tensor_model_parallel_region(input_):
     return _ScatterToModelParallelRegion.apply(input_)

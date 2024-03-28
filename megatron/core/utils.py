@@ -27,12 +27,25 @@ def get_attr_wrapped_model(model, attr):
     if isinstance(model, list):
         raise RuntimeError("_get_attr_wrapped_model given a list of models")
 
+    universal_decorators = []
     while not hasattr(model, attr):
         if not hasattr(model, "module"):
             raise RuntimeError(f"_get_attr_wrapped_model couldn't find attribute {attr}")
 
+        if hasattr(model, "universal_decorator"):
+            universal_decorators.append(getattr(model, "universal_decorator"))
         model = model.module
-    return getattr(model, attr)
+    
+    unwrapped_attr = getattr(model, attr)
+    if len(universal_decorators) == 0 or \
+      not hasattr(unwrapped_attr, "__call__") or \
+      isinstance(unwrapped_attr, torch.nn.Module):
+        #@audit-print print("getting non-decorated attr ", attr, ", reason is {} {} {}.".format(len(universal_decorators), hasattr(unwrapped_attr, "__call__"), hasattr(unwrapped_attr, "forward")))
+        return unwrapped_attr
+    else:
+        for decorator in universal_decorators[::-1]:
+            unwrapped_attr = decorator(unwrapped_attr)
+        return unwrapped_attr
 
 def get_model_type(model):
     return get_attr_wrapped_model(model, 'model_type')

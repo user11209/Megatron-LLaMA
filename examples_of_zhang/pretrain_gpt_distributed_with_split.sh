@@ -4,7 +4,7 @@
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-GPUS_PER_NODE=2
+GPUS_PER_NODE=4
 # Change for multinode config
 MASTER_ADDR=localhost
 MASTER_PORT=6000
@@ -25,15 +25,24 @@ DISTRIBUTED_ARGS="
     --master_port $MASTER_PORT
 "
 
+ORIGINAL_ARGS="
+    --tensor-model-parallel-size 4
+"
+
+TEST_ARGS="
+    --split-model-parallel-size 4 \
+    --manual-pre-post-process \
+    --selective-split-parallel
+"
+
 GPT_ARGS="
-    --split-model-parallel-size 2 \
     --num-layers 24 \
-    --hidden-size 1024 \
-    --num-attention-heads 16 \
+    --hidden-size 3072 \
+    --num-attention-heads 12 \
     --seq-length 1024 \
     --max-position-embeddings 1024 \
     --micro-batch-size 4 \
-    --global-batch-size 16 \
+    --global-batch-size 4 \
     --lr 0.00015 \
     --train-iters 500 \
     --lr-decay-iters 320000 \
@@ -64,6 +73,7 @@ OUTPUT_ARGS="
 "
 
 torchrun $DISTRIBUTED_ARGS ../pretrain_gpt.py \
+    $TEST_ARGS \
     $GPT_ARGS \
     $DATA_ARGS \
     $OUTPUT_ARGS \

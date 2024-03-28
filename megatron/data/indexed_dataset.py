@@ -388,6 +388,7 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
             return _Writer()
 
         def __init__(self, path, skip_warmup=False):
+            #@todo check why this function is called so many times for split model parallel.
             with open(path, 'rb') as stream:
                 magic_test = stream.read(9)
                 assert self._HDR_MAGIC == magic_test, (

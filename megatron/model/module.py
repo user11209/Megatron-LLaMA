@@ -80,7 +80,8 @@ class MegatronModule(torch.nn.Module):
                 init_method=init_method_normal(args.init_method_std),
                 params_dtype=args.params_dtype,
                 use_cpu_initialization=args.use_cpu_initialization,
-                perform_initialization=args.perform_initialization)
+                perform_initialization=args.perform_initialization,
+                on_split_parallel_group=args.selective_split_parallel)
             self.word_embeddings.weight.data.fill_(0)
             self.word_embeddings.weight.shared = True
 
@@ -173,8 +174,9 @@ class Float16Module(MegatronModule):
         self.float16_convertor = float16_convertor
 
 
-    def set_input_tensor(self, input_tensor):
-        return self.module.set_input_tensor(input_tensor)
+    #@audit-ok this part is not needed any more.
+    # def set_input_tensor(self, input_tensor):
+    #     return self.module.set_input_tensor(input_tensor)
 
 
     def forward(self, *inputs, **kwargs):
@@ -185,6 +187,16 @@ class Float16Module(MegatronModule):
             outputs = float16_to_fp32(outputs)
         return outputs
 
+
+    def universal_decorator(self, func):
+        def decorated_func(*inputs, **kwargs):
+            if mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage():
+                inputs = fp32_to_float16(inputs, self.float16_convertor)
+            outputs = func(*inputs, **kwargs)
+            if mpu.is_pipeline_last_stage():
+                outputs = float16_to_fp32(outputs)
+            return outputs
+        return decorated_func
 
     def state_dict(self, prefix='', keep_vars=False):
         return self.module.state_dict(prefix=prefix, keep_vars=keep_vars)

@@ -55,6 +55,11 @@ _PIPELINE_GLOBAL_RANKS = None
 # rank when broadcasting from the first or last pipeline stage.
 _SPLIT_GLOBAL_RANKS = None
 
+# A flag representing the status of split_model_parallel. =True when is warming up.
+_SPLIT_MODEL_PARALLEL_WARMUP = False
+# =True when doing selective_split_parallel for VocabParallelEmbedding and parallel_lm_logits.
+_VOCAB_SELECTIVE_SPLIT_PARALLEL = False
+
 # A list of global ranks for each data parallel group to ease calculation of the source
 # rank when broadcasting weights from src to all other data parallel ranks
 _DATA_PARALLEL_GLOBAL_RANKS = None
@@ -348,7 +353,13 @@ def get_tensor_model_parallel_group():
     """Get the tensor model parallel group the caller rank belongs to."""
     assert _TENSOR_MODEL_PARALLEL_GROUP is not None, \
         'intra_layer_model parallel group is not initialized'
-    return _TENSOR_MODEL_PARALLEL_GROUP
+    global _VOCAB_SELECTIVE_SPLIT_PARALLEL
+    if not _VOCAB_SELECTIVE_SPLIT_PARALLEL:
+        return _TENSOR_MODEL_PARALLEL_GROUP
+    else:
+        # if _VOCAB_SELECTIVE_SPLIT_PARALLEL, then is doing tensor parallel over the split model parallel group.
+        global _SPLIT_MODEL_PARALLEL_GROUP
+        return _SPLIT_MODEL_PARALLEL_GROUP
 
 
 def get_split_model_parallel_group():
@@ -522,6 +533,26 @@ def is_pipeline_last_stage(ignore_virtual=False):
         get_pipeline_model_parallel_world_size() - 1)
 
 
+def is_rank_lm_output_master(backward=False):
+    global _SPLIT_MODEL_PARALLEL_WARMUP
+    if _SPLIT_MODEL_PARALLEL_WARMUP or backward:
+        return is_rank_split_parallel_backward_0()
+    else:
+        return is_rank_split_parallel_forward()
+
+
+def is_rank_split_parallel_forward():
+    rank = torch.distributed.get_rank()
+    split_forward_rank = get_split_model_parallel_forward_rank()
+    return rank == split_forward_rank
+
+
+def is_rank_split_parallel_backward_0():
+    rank = torch.distributed.get_rank()
+    split_backward_rank_0 = get_split_model_parallel_backward_ranks()[0]
+    return rank == split_backward_rank_0
+
+
 def is_rank_in_embedding_group(ignore_virtual=False):
     """Return true if current rank is in embedding group, False otherwise."""
     rank = torch.distributed.get_rank()
@@ -619,6 +650,8 @@ def get_tensor_model_parallel_src_rank():
             return global_rank
         elif local_world_size == split_world_size-1:
             return (global_rank // split_world_size) * split_world_size + 1
+        elif local_world_size == split_world_size:
+            return (global_rank // local_world_size) * local_world_size
         else:
             assert 0, "using split model parallel, but tensor parallel size not matching! \
                         rank {}, t({}) v.s. s({})".format(global_rank, local_world_size, split_world_size)
@@ -710,6 +743,21 @@ def get_global_memory_buffer():
     assert _GLOBAL_MEMORY_BUFFER is not None, 'global memory buffer is not initialized'
     return _GLOBAL_MEMORY_BUFFER
 
+def set_split_model_parallel_warmup(warmup):
+    global _SPLIT_MODEL_PARALLEL_WARMUP
+    _SPLIT_MODEL_PARALLEL_WARMUP = warmup
+
+def get_split_model_parallel_warmup():
+    global _SPLIT_MODEL_PARALLEL_WARMUP
+    return _SPLIT_MODEL_PARALLEL_WARMUP
+
+def set_vocab_selective_split_parallel(value):
+    global _VOCAB_SELECTIVE_SPLIT_PARALLEL
+    _VOCAB_SELECTIVE_SPLIT_PARALLEL = value
+
+def get_vocab_selective_split_parallel():
+    global _VOCAB_SELECTIVE_SPLIT_PARALLEL
+    return _VOCAB_SELECTIVE_SPLIT_PARALLEL
 
 def destroy_model_parallel():
     """Set the groups to none."""

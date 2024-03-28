@@ -49,13 +49,17 @@ class GPTModel(MegatronModule):
                  num_tokentypes=0,
                  parallel_output=True,
                  pre_process=True,
-                 post_process=True):
+                 post_process=True,
+                 manual_pre_process=False,
+                 manual_post_process=False):
         args = get_args()
         super(GPTModel, self).__init__(share_word_embeddings=not args.untie_embeddings_and_output_weights)
 
         self.parallel_output = parallel_output
         self.pre_process = pre_process
         self.post_process = post_process
+        self.manual_pre_process = manual_pre_process
+        self.manual_post_process = manual_post_process
         self.fp16_lm_cross_entropy = args.fp16_lm_cross_entropy
         self.untie_embeddings_and_output_weights = args.untie_embeddings_and_output_weights
 
@@ -67,10 +71,14 @@ class GPTModel(MegatronModule):
             scaled_init_method=scaled_init_method_normal(args.init_method_std,
                                                          args.num_layers),
             pre_process=self.pre_process,
-            post_process=self.post_process)
+            post_process=self.post_process,
+            manual_pre_process=self.manual_pre_process,
+            manual_post_process=self.manual_post_process)
         
         if not args.untie_embeddings_and_output_weights:
             self.initialize_word_embeddings(init_method_normal)
+
+        self.post_process_args = None
 
     def set_input_tensor(self, input_tensor):
         """See megatron.model.transformer.set_input_tensor()"""
@@ -90,13 +98,35 @@ class GPTModel(MegatronModule):
             inference_params=inference_params)
 
         if self.post_process:
-            return post_language_model_processing(
-                lm_output, labels,
-                self.language_model.output_layer.weight if self.untie_embeddings_and_output_weights else self.word_embeddings_weight(),
-                self.parallel_output,
-                self.fp16_lm_cross_entropy)
+            if self.manual_post_process:
+                # temporarily store all these inputs of post_language_model_processing to the model.
+                self.post_process_args = (self.language_model.output_layer.weight if self.untie_embeddings_and_output_weights else self.word_embeddings_weight(),
+                    self.parallel_output,
+                    self.fp16_lm_cross_entropy)
+                return lm_output
+            else:
+                return post_language_model_processing(
+                    lm_output, labels,
+                    self.language_model.output_layer.weight if self.untie_embeddings_and_output_weights else self.word_embeddings_weight(),
+                    self.parallel_output,
+                    self.fp16_lm_cross_entropy)
         else:
             return lm_output
+
+    def model_pre_process(self, input_ids, position_ids, tokentype_ids=None):
+        encoder_input = self.language_model.embedding(input_ids, position_ids,
+                                                    tokentype_ids=tokentype_ids)
+        return encoder_input
+
+    def model_post_process(self, lm_output=None, labels=None):
+        if self.post_process_args == None:
+            reconstructed_args = (lm_output, labels, 
+                    self.language_model.output_layer.weight if self.untie_embeddings_and_output_weights else self.word_embeddings_weight(),
+                    self.parallel_output,
+                    self.fp16_lm_cross_entropy)
+        else:
+            reconstructed_args = lm_output, labels, *self.post_process_args
+        return post_language_model_processing(*reconstructed_args)
 
     def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
 

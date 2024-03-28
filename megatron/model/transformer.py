@@ -20,7 +20,7 @@ from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
 
 from megatron.core.tensor_parallel.random import check_rng_state, get_model_parallel_rng_tracker_name
 
-from megatron.core.split_parallel.logging import store_mid_tensor
+from megatron.core.tensor_parallel.logging import store_mid_tensor
 
 try:
     from einops import rearrange
@@ -651,7 +651,7 @@ class ChunkedAttention(MegatronModule):
             if self.attention_type == AttnType.self_attn:
                 # Attention heads [sq, b, h] --> [sq, b, (np * 3 * hn)]
                 mixed_x_layer, _ = self.query_key_value[chunk_id](hidden_states)
-                store_mid_tensor("qkv", mixed_x_layer)
+                store_mid_tensor("qkv", mixed_x_layer)#@audit-print
                 query_layer, key_layer, value_layer = tensor_parallel.split_tensor_along_last_dim(mixed_x_layer, 3)
 
                 # Changed layout, for compatibility with CKPT conversion
@@ -757,7 +757,7 @@ class ChunkedAttention(MegatronModule):
                 else:
                     context_layer = self.core_attention(
                         query_layer, key_layer, value_layer, attention_mask, tracker_id=chunk_id)
-                    store_mid_tensor("core_attn_output", context_layer)
+                    store_mid_tensor("core_attn_output", context_layer)#@audit-print
             else:
                 q, k, v = [rearrange(x, 's b ... -> b s ...').contiguous()
                         for x in (query_layer, key_layer, value_layer)]
@@ -775,7 +775,7 @@ class ChunkedAttention(MegatronModule):
         # =================
 
         output, bias = self.dense(context_layer_chunks)
-        store_mid_tensor("self_attention_output", output)
+        store_mid_tensor("self_attention_output", output)#@audit-print
 
         return output, bias
 
@@ -933,7 +933,7 @@ class ParallelAttention(MegatronModule):
         if self.attention_type == AttnType.self_attn:
             # Attention heads [sq, b, h] --> [sq, b, (np * 3 * hn)]
             mixed_x_layer, _ = self.query_key_value(hidden_states)
-            store_mid_tensor("qkv", mixed_x_layer)
+            store_mid_tensor("qkv", mixed_x_layer)#@audit-print
             query_layer, key_layer, value_layer = tensor_parallel.split_tensor_along_last_dim(mixed_x_layer, 3)
 
             # Changed layout, for compatibility with CKPT conversion
@@ -1037,7 +1037,7 @@ class ParallelAttention(MegatronModule):
             else:
                 context_layer = self.core_attention(
                     query_layer, key_layer, value_layer, attention_mask)
-                store_mid_tensor("core_attn_output", context_layer)
+                store_mid_tensor("core_attn_output", context_layer)#@audit-print
         else:
             q, k, v = [rearrange(x, 's b ... -> b s ...').contiguous()
                        for x in (query_layer, key_layer, value_layer)]
@@ -1053,7 +1053,7 @@ class ParallelAttention(MegatronModule):
         # =================
 
         output, bias = self.dense(context_layer)
-        store_mid_tensor("self_attention_output", output)
+        store_mid_tensor("self_attention_output", output)#@audit-print
 
         return output, bias
 
@@ -1099,7 +1099,7 @@ class ParallelTransformerLayer(MegatronModule):
     def __init__(self, init_method, output_layer_init_method,
                  layer_number, layer_type=LayerType.encoder,
                  self_attn_mask_type=AttnMaskType.padding,
-                 drop_path_rate=0.):
+                 drop_path_rate=0., fuse_final_layernorm=False):
         args = get_args()
 
         super(ParallelTransformerLayer, self).__init__()
@@ -1114,6 +1114,7 @@ class ParallelTransformerLayer(MegatronModule):
 
         self.split_parallel_forward = (mpu.get_split_model_parallel_world_size() > 1) and \
                                         (mpu.get_split_model_parallel_rank() == 0)
+        self.fuse_final_layernorm = fuse_final_layernorm
 
         # Layernorm on the input data.
         self.input_layernorm = LayerNorm(
@@ -1175,6 +1176,14 @@ class ParallelTransformerLayer(MegatronModule):
             else:
                 self.mlp = ChunkedMLP(init_method, output_layer_init_method)
 
+        if self.fuse_final_layernorm:
+            self.final_layernorm = LayerNorm(
+                args.hidden_size,
+                eps=args.layernorm_epsilon,
+                no_persist_layer_norm=args.no_persist_layer_norm,
+                sequence_parallel=args.sequence_parallel,
+                apply_layernorm_1p=args.apply_layernorm_1p)
+
         # Set bias+dropout+add fusion grad_enable execution handler.
         TORCH_MAJOR = int(torch.__version__.split('.')[0])
         TORCH_MINOR = int(torch.__version__.split('.')[1])
@@ -1197,7 +1206,7 @@ class ParallelTransformerLayer(MegatronModule):
                 inference_params=inference_params,
                 rotary_pos_emb=rotary_pos_emb)
 
-        store_mid_tensor("attention_output", attention_output)
+        store_mid_tensor("attention_output", attention_output)#@audit-print
 
         # Residual connection.
         if self.apply_residual_connection_post_layernorm:
@@ -1296,6 +1305,9 @@ class ParallelTransformerLayer(MegatronModule):
                                               training=self.training)
             output = residual + self.drop_path(out)
 
+        if self.fuse_final_layernorm:
+            output = self.final_layernorm(output)
+
         return output
 
 
@@ -1385,7 +1397,8 @@ class ParallelTransformer(MegatronModule):
                  self_attn_mask_type=AttnMaskType.padding,
                  post_layer_norm=True,
                  pre_process=True, post_process=True,
-                 drop_path_rate=0.0):
+                 manual_pre_process=False, manual_post_process=False,
+                 drop_path_rate=0.0, fuse_final_layernorm=False):
         super(ParallelTransformer, self).__init__()
         args = get_args()
 
@@ -1396,9 +1409,12 @@ class ParallelTransformer(MegatronModule):
         self.post_layer_norm = post_layer_norm
         self.pre_process = pre_process
         self.post_process = post_process
+        self.manual_pre_process = manual_pre_process
+        self.manual_post_process = manual_post_process
         self.input_tensor = None
         self.drop_path_rate = drop_path_rate
         self.transformer_impl = args.transformer_impl
+        self.fuse_final_layernorm = fuse_final_layernorm
 
         # Store activation checkpoiting flag.
         self.recompute_granularity = args.recompute_granularity
@@ -1411,6 +1427,8 @@ class ParallelTransformer(MegatronModule):
 
         # Transformer Engine Init.
         if self.transformer_impl == 'transformer_engine':
+            assert not self.fuse_final_layernorm, \
+                "transformer engine does not support fusing final layernorm into ParallelTransformerLayer!"
             global transformer_engine
             import transformer_engine
         self.use_fp8 = args.fp8_e4m3 or args.fp8_hybrid
@@ -1446,13 +1464,25 @@ class ParallelTransformer(MegatronModule):
         # Transformer layers.
         def build_layer(layer_number):
             if args.transformer_impl == 'local':
-                return ParallelTransformerLayer(
-                    init_method,
-                    output_layer_init_method,
-                    layer_number,
-                    layer_type=layer_type,
-                    self_attn_mask_type=self_attn_mask_type,
-                    drop_path_rate=self.drop_path_rates[layer_number - 1])
+                if self.fuse_final_layernorm and self.post_process \
+                  and layer_number == mpu.get_pipeline_model_parallel_world_size() * self.num_layers:
+                    return ParallelTransformerLayer(
+                        init_method,
+                        output_layer_init_method,
+                        layer_number,
+                        layer_type=layer_type,
+                        self_attn_mask_type=self_attn_mask_type,
+                        drop_path_rate=self.drop_path_rates[layer_number - 1],
+                        fuse_final_layernorm=True
+                    )
+                else:
+                    return ParallelTransformerLayer(
+                        init_method,
+                        output_layer_init_method,
+                        layer_number,
+                        layer_type=layer_type,
+                        self_attn_mask_type=self_attn_mask_type,
+                        drop_path_rate=self.drop_path_rates[layer_number - 1])
             else:
                 return transformer_engine.pytorch.TransformerLayer(
                     args.hidden_size,
@@ -1529,7 +1559,7 @@ class ParallelTransformer(MegatronModule):
             self.layers = torch.nn.ModuleList(
                 [build_layer(i + 1 + offset) for i in range(self.num_layers)])
 
-        if self.post_process and self.post_layer_norm:
+        if self.post_process and self.post_layer_norm and not self.fuse_final_layernorm:
             # Final layer norm before output.
             self.final_layernorm = LayerNorm(
                 args.hidden_size,
@@ -1636,7 +1666,7 @@ class ParallelTransformer(MegatronModule):
             assert self.recompute_granularity is None, \
                 'inference does not work with activation checkpointing'
 
-        if not self.pre_process:
+        if not self.pre_process or self.manual_pre_process:
             # See set_input_tensor()
             hidden_states = self.input_tensor
 
@@ -1714,7 +1744,7 @@ class ParallelTransformer(MegatronModule):
                     self.microbatch_count += 1
 
         # Final layer norm.
-        if self.post_process and self.post_layer_norm:
+        if self.post_process and self.post_layer_norm and not self.fuse_final_layernorm:
             hidden_states = self.final_layernorm(hidden_states)
 
         return hidden_states

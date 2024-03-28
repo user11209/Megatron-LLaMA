@@ -13,13 +13,14 @@ from megatron import get_timers
 from megatron import get_tokenizer
 from megatron.core import tensor_parallel
 from megatron.core.enums import ModelType
+from megatron.core.utils import get_attr_wrapped_model
 from megatron.data.gpt_dataset import build_train_valid_test_datasets
 from megatron.model import GPTModel
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group
 
-def model_provider(pre_process=True, post_process=True):
+def model_provider(pre_process=True, post_process=True, manual_pre_process=False, manual_post_process=False):
     """Build the model."""
 
     print_rank_0('building GPT model ...')
@@ -27,7 +28,9 @@ def model_provider(pre_process=True, post_process=True):
         num_tokentypes=0,
         parallel_output=True,
         pre_process=pre_process,
-        post_process=post_process
+        post_process=post_process,
+        manual_pre_process=manual_pre_process,
+        manual_post_process=manual_post_process
     )
     return model
 
@@ -72,24 +75,69 @@ def loss_func(loss_mask, output_tensor):
     averaged_loss = average_losses_across_data_parallel_group([loss])
 
     return loss, {'lm loss': averaged_loss[0]}
+    
 
+class ForwardStep:
+    def __init__(self):
+        self.lm_output_buffer = None
+        self.timers = None
 
-def forward_step(data_iterator, model):
-    """Forward step."""
-    args = get_args()
-    timers = get_timers()
+    def __call__(self, data_iterator, model):
+        """Forward step."""
+        args = get_args()
+        if self.timers == None:
+            self.timers = get_timers()
 
-    # Get the batch.
-    timers('batch-generator', log_level=2).start()
-    tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
-        data_iterator)
-    timers('batch-generator').stop()
+        # Get the batch.
+        self.timers('batch-generator', log_level=2).start()
+        tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
+            data_iterator)
+        self.timers('batch-generator').stop()
 
-    output_tensor = model(tokens, position_ids, attention_mask,
-                          labels=labels)
+        output_tensor = model(tokens, position_ids, attention_mask,
+                            labels=labels)
 
-    return output_tensor, partial(loss_func, loss_mask)
+        return output_tensor, partial(loss_func, loss_mask)
 
+    def preprocess(self, data_iterator, model, do_vocab_embedding=True):
+        if self.timers == None:
+            self.timers = get_timers()
+
+        # Get the batch.
+        self.timers('batch-generator', log_level=2).start()
+        tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
+            data_iterator)
+        self.timers('batch-generator').stop()
+
+        self.tokens = tokens
+        self.position_ids = position_ids
+        self.labels = labels
+        self.loss_mask = loss_mask
+        self.attention_mask = attention_mask
+        # this returned value need to be set to transformer model using model.set_input_tensor.
+        if do_vocab_embedding:
+            pre_process_func = get_attr_wrapped_model(model, "model_pre_process")
+            lm_input = pre_process_func(tokens, position_ids)
+        return lm_input
+
+    def main_process(self, model):
+        #@note self.tokens, self.position_ids, self.labels are just placeholders here. can be None if nothing goes wrong.
+        lm_output = model(self.tokens, self.position_ids, self.attention_mask,
+                        labels=self.labels)
+        return lm_output
+
+    def postprocess(self, model, lm_output, is_proto=False):
+        if lm_output == None:
+            assert self.lm_output_buffer != None, \
+                "post_process need at least a proto to construct an all-reduce buffer."
+            lm_output = self.lm_output_buffer
+        elif is_proto and self.lm_output_buffer == None:
+            self.lm_output_buffer = lm_output
+        post_process_func = get_attr_wrapped_model(model, "model_post_process")
+        output_tensor = post_process_func(lm_output, self.labels)
+        return output_tensor, partial(loss_func, self.loss_mask)
+
+forward_step = ForwardStep()
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):
     """Build train, valid, and test datasets."""

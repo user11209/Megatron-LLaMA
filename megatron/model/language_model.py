@@ -18,11 +18,19 @@ from .utils import init_method_normal, scaled_init_method_normal
 
 
 def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
-                       bias=None):
+                       bias=None, ):
     """LM logits using word embedding weights."""
     args = get_args()
     # Parallel logits.
-    if args.async_tensor_model_parallel_allreduce or\
+    if args.selective_split_parallel:
+        assert mpu.get_tensor_model_parallel_group() == mpu.get_split_model_parallel_group(), \
+            "if args.selective_split_parallel, make sure TP group is changed to SP group at postprocessing time."
+        assert not args.sequence_parallel, "sequence_parallel is not supported with split_model_parallel yet."
+        assert mpu.get_tensor_model_parallel_world_size() > 1, "split_model_parallel size must be larger then 1"
+        tensor_parallel.broadcast_to_tensor_model_parallel_region(input_, broadcast_on_forward=True)
+        input_parallel = input_
+        async_grad_allreduce = args.async_tensor_model_parallel_allreduce
+    elif args.async_tensor_model_parallel_allreduce or\
             args.sequence_parallel:
         input_parallel = input_
         model_parallel = mpu.get_tensor_model_parallel_world_size() > 1
@@ -53,7 +61,8 @@ def get_language_model(num_tokentypes, add_pooler,
                        scaled_init_method=None, add_encoder=True,
                        add_decoder=False,
                        decoder_attn_mask_type=AttnMaskType.causal,
-                       pre_process=True, post_process=True):
+                       pre_process=True, post_process=True,
+                       manual_pre_process=False, manual_post_process=False):
     """Build language model and return along with the key to save."""
     args = get_args()
 
@@ -75,7 +84,9 @@ def get_language_model(num_tokentypes, add_pooler,
         decoder_attn_mask_type=decoder_attn_mask_type,
         add_pooler=add_pooler,
         pre_process=pre_process,
-        post_process=post_process
+        post_process=post_process,
+        manual_pre_process=manual_pre_process,
+        manual_post_process=manual_post_process
     )
     # key used for checkpoints.
     language_model_key = 'language_model'
@@ -154,7 +165,8 @@ class Embedding(MegatronModule):
             init_method=self.init_method,
             params_dtype=args.params_dtype,
             use_cpu_initialization=args.use_cpu_initialization,
-            perform_initialization=args.perform_initialization
+            perform_initialization=args.perform_initialization,
+            on_split_parallel_group=args.selective_split_parallel
         )
         self._word_embeddings_key = 'word_embeddings'
 
@@ -335,7 +347,9 @@ class TransformerLanguageModel(MegatronModule):
                  decoder_attn_mask_type=AttnMaskType.causal,
                  add_pooler=False,
                  pre_process=True,
-                 post_process=True):
+                 post_process=True,
+                 manual_pre_process=False,
+                 manual_post_process=False):
         args = get_args()
         # TODO: passing share_word_embeddings=False will not work correctly for T5 and embeddings will not be synced. Fix later for T5.
         if args.untie_embeddings_and_output_weights: assert not add_decoder
@@ -353,6 +367,8 @@ class TransformerLanguageModel(MegatronModule):
         self.add_pooler = add_pooler
         self.encoder_hidden_state = None
         self.untie_embeddings_and_output_weights = args.untie_embeddings_and_output_weights
+        self.manual_pre_process = manual_pre_process
+        self.manual_post_process = manual_post_process
 
         # Embeddings.
         if self.pre_process:
@@ -397,6 +413,8 @@ class TransformerLanguageModel(MegatronModule):
         # architecture and in encoder-only stage).
         if self.add_encoder:
             if args.retro_add_retriever:
+                assert not self.manual_post_process, \
+                    "RetroTransformer with manually split pre/post-process is not supported yet!"
                 self.encoder = ParallelRetroTransformer(
                     self.init_method,
                     output_layer_init_method,
@@ -412,6 +430,9 @@ class TransformerLanguageModel(MegatronModule):
                     self_attn_mask_type=self.encoder_attn_mask_type,
                     pre_process=self.pre_process,
                     post_process=self.post_process,
+                    manual_pre_process=self.manual_pre_process,
+                    manual_post_process=self.manual_post_process,
+                    fuse_final_layernorm=self.manual_post_process
                 )
             self._encoder_key = 'encoder'
         else:
@@ -485,13 +506,14 @@ class TransformerLanguageModel(MegatronModule):
 
         # Retriever embedding.
         if self.retriever and self.pre_process:
+            assert not self.manual_pre_process, "by zhang: I don't understand what retriever is yet. not supported."
             retriever_input = self.embedding(ret_input_ids, ret_position_ids,
                                              tokentype_ids=tokentype_ids)
         else:
             retriever_input = None
 
         # Encoder embedding.
-        if self.pre_process:
+        if self.pre_process and not self.manual_pre_process:
             encoder_input = self.embedding(enc_input_ids, enc_position_ids,
                                            tokentype_ids=tokentype_ids)
         else:
@@ -541,6 +563,7 @@ class TransformerLanguageModel(MegatronModule):
             else:
                 return encoder_output
 
+        assert not self.manual_pre_process, "by zhang: gpt-2 does not use decoder, so leave this part for later edition. not supported."
         # Decoder embedding.
         if self.pre_process:
             decoder_input = self.embedding(dec_input_ids,

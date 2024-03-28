@@ -90,6 +90,12 @@ def validate_args(args, defaults={}):
                     args.pipeline_model_parallel_size, 'split rank needs'\
                     ' to be less than pipeline model parallel size ({})'.format(
                             args.pipeline_model_parallel_size)
+    if args.selective_split_parallel:
+        assert args.manual_pre_post_process, \
+            "must manually seperate pre/post-process before using different parallel strategies. designed by zhang."
+    if args.manual_pre_post_process:
+        assert args.split_model_parallel_size > 1, \
+            "manual_pre_post_process flag is currently only designed for split model parallel designed by zhang."
 
     # Deprecated arguments
     assert args.batch_size is None, '--batch-size argument is no longer ' \
@@ -967,6 +973,12 @@ def _add_distributed_args(parser):
                        '--tensor-model-parallel-size instead.')
     group.add_argument('--num-layers-per-virtual-pipeline-stage', type=int, default=None,
                        help='Number of layers per virtual pipeline stage')
+    group.add_argument('--manual-pre-post-process', action='store_true', default=False, 
+                       help='disassemble pre_process and post_process from the model, '
+                       'and manually deal with them. developed by zhang.')
+    group.add_argument('--selective-split-parallel', action='store_true', default=False,
+                       help='only do split parallel for transformer layers, '
+                       'leave preprocesses and postprocesses to tensor parallel.')
     group.add_argument('--distributed-backend', default='nccl',
                        choices=['nccl', 'gloo'],
                        help='Which backend to use for distributed training.')

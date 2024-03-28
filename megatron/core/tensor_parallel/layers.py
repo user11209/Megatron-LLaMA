@@ -22,6 +22,7 @@ from megatron.core.parallel_state import (
     get_split_model_parallel_world_size,
     get_split_model_parallel_rank,
     get_global_memory_buffer,
+    get_vocab_selective_split_parallel
 )
 from .mappings import (
     copy_to_tensor_model_parallel_region,
@@ -30,6 +31,7 @@ from .mappings import (
     reduce_from_tensor_model_parallel_region,
     scatter_to_tensor_model_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
+    broadcast_to_tensor_model_parallel_region
 )
 
 from .random import get_cuda_rng_tracker, get_model_parallel_rng_tracker_name
@@ -38,6 +40,8 @@ from .utils import (
     split_tensor_along_last_dim,
     VocabUtility,
 )
+
+from megatron import get_args
 
 from .logging import store_mid_tensor
 
@@ -109,7 +113,8 @@ def _initialize_affine_weight_cpu(weight, output_size, input_size,
                                   per_partition_size, partition_dim,
                                   init_method, stride=1,
                                   return_master_weight=False,
-                                  *, params_dtype=torch.float32):
+                                  *, params_dtype=torch.float32,
+                                  on_split_parallel_group=False):
     """Initialize affine weight for model parallel.
 
     Build the master weight on all processes and scatter
@@ -131,8 +136,12 @@ def _initialize_affine_weight_cpu(weight, output_size, input_size,
     per_partition_per_stride_size = divide(per_partition_size, stride)
     weight_list = torch.split(master_weight, per_partition_per_stride_size,
                               dim=partition_dim)
-    rank = get_tensor_model_parallel_rank()
-    world_size = get_tensor_model_parallel_world_size()
+    if not on_split_parallel_group:
+        rank = get_tensor_model_parallel_rank()
+        world_size = get_tensor_model_parallel_world_size()
+    else:
+        rank = get_split_model_parallel_rank()
+        world_size = get_split_model_parallel_world_size()
     my_weight_list = weight_list[rank::world_size]
 
     with torch.no_grad():
@@ -162,7 +171,8 @@ class VocabParallelEmbedding(torch.nn.Module):
                  init_method=init.xavier_normal_,
                  params_dtype: torch.dtype=torch.float32,
                  use_cpu_initialization: bool=False,
-                 perform_initialization: bool=True):
+                 perform_initialization: bool=True,
+                 on_split_parallel_group: bool=False):
         super(VocabParallelEmbedding, self).__init__()
         # Keep the input dimensions.
         self.num_embeddings = num_embeddings
@@ -174,18 +184,28 @@ class VocabParallelEmbedding(torch.nn.Module):
         self.scale_grad_by_freq = False
         self.sparse = False
         self._weight = None
-        self.tensor_model_parallel_size = get_tensor_model_parallel_world_size()
-        # Divide the weight matrix along the vocaburaly dimension.
-        self.vocab_start_index, self.vocab_end_index = \
-            VocabUtility.vocab_range_from_global_vocab_size(
-                self.num_embeddings, get_tensor_model_parallel_rank(),
-                self.tensor_model_parallel_size)
+        self.on_split_parallel_group = on_split_parallel_group
+        if not on_split_parallel_group:
+            self.tensor_model_parallel_size = get_tensor_model_parallel_world_size()
+            # Divide the weight matrix along the vocaburaly dimension.
+            self.vocab_start_index, self.vocab_end_index = \
+                VocabUtility.vocab_range_from_global_vocab_size(
+                    self.num_embeddings, get_tensor_model_parallel_rank(),
+                    self.tensor_model_parallel_size)
+        else:
+            self.tensor_model_parallel_size = get_split_model_parallel_world_size()
+            self.vocab_start_index, self.vocab_end_index = \
+                VocabUtility.vocab_range_from_global_vocab_size(
+                    self.num_embeddings, get_split_model_parallel_rank(),
+                    self.tensor_model_parallel_size)
+            # if using selective split parallel, a.k.a. using tensor parallel on the whole split model parallel group for vocab embedding, make sure it is initialized on cpu.(spares the effort of a new rng tracker.)
+            use_cpu_initialization = True
+
         self.num_embeddings_per_partition = self.vocab_end_index - \
             self.vocab_start_index
 
         # Allocate weights and initialize.
         if use_cpu_initialization:
-            assert get_split_model_parallel_world_size() == 1, "You cannot use cpu initialization when using split model parallel!"
             self.weight = Parameter(torch.empty(
                 self.num_embeddings_per_partition, self.embedding_dim,
                 dtype=params_dtype))
@@ -193,8 +213,9 @@ class VocabParallelEmbedding(torch.nn.Module):
                 _initialize_affine_weight_cpu(
                     self.weight, self.num_embeddings, self.embedding_dim,
                     self.num_embeddings_per_partition, 0, init_method,
-                    params_dtype=params_dtype)
+                    params_dtype=params_dtype, on_split_parallel_group=on_split_parallel_group)
         else:
+            assert not on_split_parallel_group, "when doing selective split parallel, vocab embedding must be initialized on cpu!"
             self.weight = Parameter(torch.empty(
                 self.num_embeddings_per_partition, self.embedding_dim,
                 device=torch.cuda.current_device(), dtype=params_dtype))
@@ -212,6 +233,10 @@ class VocabParallelEmbedding(torch.nn.Module):
                                                 partition_dim=0, stride=1)
 
     def forward(self, input_):
+        assert self.tensor_model_parallel_size == get_tensor_model_parallel_world_size(), \
+            "Seems there is a mistake using selective_split_parallel on tensor_model_parallel_group, " \
+            "or not using selective_split_parallel on split_model_parallel_group. size if {} v.s. {}. At this time, check _VOCAB_SELECTIVE_SPLIT_PARALLEL: {}" \
+            .format(self.tensor_model_parallel_size, get_tensor_model_parallel_world_size(), get_vocab_selective_split_parallel())
         if self.tensor_model_parallel_size > 1:
             # Build the mask.
             input_mask = (input_ < self.vocab_start_index) | \
@@ -230,7 +255,10 @@ class VocabParallelEmbedding(torch.nn.Module):
         if self.tensor_model_parallel_size > 1:
             output_parallel[input_mask, :] = 0.0
         # Reduce across all the model parallel GPUs.
-        output = reduce_from_tensor_model_parallel_region(output_parallel)
+        if not self.on_split_parallel_group:
+            output = reduce_from_tensor_model_parallel_region(output_parallel)
+        else:
+            output = broadcast_to_tensor_model_parallel_region(output_parallel, broadcast_on_forward=False)
         return output
 
 
@@ -732,7 +760,7 @@ class RowParallelLinear(torch.nn.Module):
             async_grad_allreduce=False,
             sequence_parallel_enabled=False,
         )
-        store_mid_tensor("row_split_matmul_output", output_parallel)
+        store_mid_tensor("row_split_matmul_output", output_parallel)#@audit-print
 
         # All-reduce across all the partitions.
         if self.sequence_parallel_enabled:
@@ -878,7 +906,7 @@ class RowChunkedLinear(torch.nn.Module):
                 async_grad_allreduce=False,
                 sequence_parallel_enabled=False,
             )
-            store_mid_tensor("row_split_matmul_output", output_parallel)
+            store_mid_tensor("row_split_matmul_output", output_parallel)#@audit-print
             # Sum-up across all the partitions.
             if output_ == None:
                 output_ = output_parallel

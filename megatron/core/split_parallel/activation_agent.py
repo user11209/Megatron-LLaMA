@@ -13,6 +13,7 @@ from megatron.core.parallel_state import (
     get_global_memory_buffer,
     initialize_model_parallel,
     destroy_model_parallel,
+    set_split_model_parallel_warmup,
 )
 
 import time
@@ -21,7 +22,7 @@ import code
 import torch.multiprocessing as mp
 from datetime import timedelta
 
-from .logging import do_log
+from megatron.core.tensor_parallel.logging import do_log
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -73,6 +74,7 @@ def subprocess_schedule_buffer_transfer(some_zero, args, p2c_pipe, p_c_queue, c_
           return
 
     if split_parallel_rank == 0:
+      #@todo need to be changed if not only two ranks. Need to send to all partners.
       while True:
         buffer_id = p_c_queue.get()
         do_log(parallel_rank, "the first to be send is", buffer_id)
@@ -153,7 +155,7 @@ def subprocess_schedule_buffer_transfer(some_zero, args, p2c_pipe, p_c_queue, c_
         recv_ops_cpu = []
         buffer_id_list = []
         device_list = []
-        #TODO: find a way to get a number of queue_size buffer_id's
+        # get a number of queue_size buffer_id's
         while len(recv_ops) + len(recv_ops_cpu) < queue_size:
           buffer_id = next_recv
           do_log(parallel_rank, "checking buffer id ", buffer_id)
@@ -212,8 +214,11 @@ def subprocess_schedule_buffer_transfer(some_zero, args, p2c_pipe, p_c_queue, c_
     do_log(parallel_rank, "something went wrong: ", traceback.format_exc(e))
   return
 
-#TODO: each agent should belong to a layer. when a layer produces a tensor to be send, it is passed to ActivationAgent with a buffer name, it will be sent to the partner agent. the agent owns a subprocess(on init), which share tensor buffer with its parentprocess. One problem is, share memory tensors should be created before subprocesses are created, so they need to be created before transformer layers are called. That means it's necessary to fetch the tensor buffer before calling the layer and write the calculated values to the buffer directly.
+
 class ActivationAgent:
+  """
+  When a layer produces a tensor to be send, it is passed to ActivationAgent with a buffer name, it will be sent to the partner agent. the agent owns a subprocess(on init), which share tensor buffer with its parentprocess.
+  """
   def __init__(self, init_only=False):
 
     self.id2obj_dict = {}
@@ -224,6 +229,8 @@ class ActivationAgent:
     self.p2c_pipe_p, p2c_pipe_c = mp.Pipe()
     self.p_c_queue = mp.Manager().Queue()
     self.c_p_queue = mp.Manager().Queue()
+    self.is_sender_agent = None
+    self.child_fully_initialized = False
     args = get_args()
 
     # start the subprocess before torch.distributed.init_process_group
@@ -231,9 +238,10 @@ class ActivationAgent:
                                           args=(args, p2c_pipe_c, self.p_c_queue, self.c_p_queue, torch.cuda.current_device(), init_only), join=False)
 
   def identify_activation_agent_role(self):
-    self.is_sender_agent = (get_split_model_parallel_rank() == 0)
-    #TODO: need to be changed if not only two ranks
-    self.partner_rank = 0 if not self.is_sender_agent else 1
+    if self.is_sender_agent == None:
+      self.is_sender_agent = (get_split_model_parallel_rank() == 0)
+      #@todo : need to be changed if not only two ranks
+      self.partner_rank = 0 if not self.is_sender_agent else 1
 
 
   def add_tensor_buffer_like(self, tensor_name, tensor_prototype, copy_count=8):
@@ -386,16 +394,19 @@ class ActivationAgent:
     self.p_c_queue.put(tensor_id)
     return True
 
-  def trigger_schedule(self):
+  def trigger_schedule(self, clear_history=False):
     """
-    remove all labels, namely timer, occupied_range and valid_to_schedule. 
     create a subprocess and run schedule_buffer_transfer.
+
+    if clear_history: remove all labels, namely timer, occupied_range and valid_to_schedule. 
+      not recommended, because history may contain important variables, typically for non-stand-alone warmup.
     """
-    for tensor_id, buffer_item in self.id2obj_dict.items():
-      if "buffer" in buffer_item:
-        buffer_item["occupied_range"].zero_()
-        buffer_item["timer"].zero_()
-        buffer_item["valid_to_schedule"].zero_()
+    if clear_history:
+      for tensor_id, buffer_item in self.id2obj_dict.items():
+        if "buffer" in buffer_item:
+          buffer_item["occupied_range"].zero_()
+          buffer_item["timer"].zero_()
+          buffer_item["valid_to_schedule"].zero_()
     self.schedule_buffer_transfer()
 
   def ping_pong_check(self, info=1, tag=""):
@@ -414,9 +425,12 @@ class ActivationAgent:
     schedule the transfer of all buffers. A subprocess will be opened to do the 
     transfer without blocking the computation of the main process.
     """
-    self.ping_pong_check(info=3, tag="the last stage")
-    self.p2c_pipe_p.send(self.id2obj_dict)
-    print("id2obj_dict send to activation agent succeeded!")
+    # this function may be called repeatedly. If this is not the first time, then skip this function.
+    if not self.child_fully_initialized:
+      self.ping_pong_check(info=3, tag="the last stage")
+      self.p2c_pipe_p.send(self.id2obj_dict)
+      print("id2obj_dict send to activation agent succeeded!")
+      self.child_fully_initialized = True
 
   def wait_for_schedule(self):
     """
@@ -450,7 +464,6 @@ class ActivationAgent:
 
 
 def init_activation_agent(init_only=False):
-  #TODO: confirm its is_sender_agent and partner_rank, where to do this
   global _ACTIVATION_AGENT
   _ACTIVATION_AGENT = ActivationAgent(init_only)
   pass
@@ -459,16 +472,16 @@ def get_activation_agent():
   assert _ACTIVATION_AGENT != None
   return _ACTIVATION_AGENT
 
-def identify_activation_agent_role():
-  assert _ACTIVATION_AGENT != None
-  _ACTIVATION_AGENT.identify_activation_agent_role()
-
 def set_activationagent_warmup(set_warmup):
   global _WARMUP_ACTIVATION_AGENT
   global _ACTIVATION_AGENT
+  assert _ACTIVATION_AGENT != None
+  _ACTIVATION_AGENT.identify_activation_agent_role()
+
   _WARMUP_ACTIVATION_AGENT = set_warmup
+  set_split_model_parallel_warmup(set_warmup)
   if set_warmup == False:
-    _ACTIVATION_AGENT.trigger_schedule()
+    _ACTIVATION_AGENT.trigger_schedule(clear_history=False)
 
 def is_activationagent_warmup():
   return _WARMUP_ACTIVATION_AGENT

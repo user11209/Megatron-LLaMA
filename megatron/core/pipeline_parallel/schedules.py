@@ -12,7 +12,7 @@ from megatron.core.pipeline_parallel import p2p_communication
 from megatron.core.enums import ModelType
 from megatron.core.utils import get_attr_wrapped_model, get_model_type
 
-from megatron.core.split_parallel.schedules import forward_backward_split, forward_backward_split_debug
+from megatron.core.split_parallel.schedules import forward_backward_split, forward_backward_split_selective
 from megatron import get_args
 
 # Types
@@ -120,10 +120,10 @@ def get_forward_backward_func():
     """
     pipeline_model_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
     split_model_parallel_size = parallel_state.get_split_model_parallel_world_size()
-    if split_model_parallel_size != 0:
+    if split_model_parallel_size > 1:
         args = get_args()
-        if args.debug_split_parallel:
-            forward_backward_func = forward_backward_split_debug
+        if args.selective_split_parallel:
+            forward_backward_func = forward_backward_split_selective
         else:
             forward_backward_func = forward_backward_split
     elif pipeline_model_parallel_size > 1:
